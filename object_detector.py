@@ -8,12 +8,10 @@ https://github.com/WSU-RAS/object_detection/blob/master/scripts/object_detector.
 Also, referenced for the RPi camera stuff:
 https://github.com/EdjeElectronics/TensorFlow-Object-Detection-on-the-Raspberry-Pi/blob/master/Object_detection_picamera.py
 
-And for TF Lite stuff -- i.e. most of the auxiliary functions like iou,
-non_max_suppression, etc. are almost copy-pasted from here:
+And for some TF Lite stuff:
 https://github.com/freedomtan/tensorflow/blob/deeplab_tflite_python/tensorflow/contrib/lite/examples/python/object_detection.py
 """
 import os
-import math
 import time
 import numpy as np
 import tensorflow as tf
@@ -30,12 +28,6 @@ try:
 except ImportError:
     print("Warning: cannot import picamera, will only work in offline mode")
 
-
-X_SCALE = 10.0
-Y_SCALE = 10.0
-H_SCALE = 5.0
-W_SCALE = 5.0
-
 def load_image_into_numpy_array(image):
     """
     Helper function from: models/research/object_detection/
@@ -47,8 +39,6 @@ def find_files(folder, prefix="", extension=".jpg"):
     """
     Find all files recursively in specified folder with a particular
     prefix and extension
-
-    (for running on set of test images)
     """
     files = []
 
@@ -59,123 +49,11 @@ def find_files(folder, prefix="", extension=".jpg"):
 
     return files
 
-def load_box_priors(filename):
-    """
-    Load the box_priors.txt file
-
-    You can get this file from:
-    https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/lite/examples/android/app/src/main/assets/box_priors.txt
-    """
-    box_priors = []
-
-    with open(filename, 'r') as f:
-        count = 0
-
-        for line in f:
-            row = line.strip().split(' ')
-            box_priors.append(row)
-            count += 1
-
-            if count == 4:
-                break
-
-    return box_priors
-
-def decode_center_size_boxes(predictions, box_priors):
-    """ Scale and use the box priors to compute the bounding box positions in
-    terms of the image pixels """
-    results = []
-
-    for i in range(0, len(predictions)):
-        ycenter = predictions[i][0] / Y_SCALE * np.float(box_priors[2][i]) \
-                + np.float(box_priors[0][i])
-        xcenter = predictions[i][1] / X_SCALE * np.float(box_priors[3][i]) \
-                + np.float(box_priors[1][i])
-        h = math.exp(predictions[i][2] / H_SCALE) * np.float(box_priors[2][i])
-        w = math.exp(predictions[i][3] / W_SCALE) * np.float(box_priors[3][i])
-
-        ymin = ycenter - h / 2.0
-        xmin = xcenter - w / 2.0
-        ymax = ycenter + h / 2.0
-        xmax = xcenter + w / 2.0
-
-        results.append((ymin, xmin, ymax, xmax))
-
-    return results
-
-def iou(box_a, box_b):
-    """ Calculate intersection over union """
-    x_a = max(box_a[0], box_b[0])
-    y_a = max(box_a[1], box_b[1])
-    x_b = min(box_a[2], box_b[2])
-    y_b = min(box_a[3], box_b[3])
-
-    intersection_area = (x_b - x_a + 1) * (y_b - y_a + 1)
-
-    box_a_area = (box_a[2] - box_a[0] + 1) * (box_a[3] - box_a[1] + 1)
-    box_b_area = (box_b[2] - box_b[0] + 1) * (box_b[3] - box_b[1] + 1)
-
-    iou = intersection_area / float(box_a_area + box_b_area - intersection_area)
-
-    return iou
-
-def non_max_suppression(predictions, iou_threshold, max_boxes):
-    """ Perform non-max suppression """
-    sorted_p = sorted(predictions, reverse=True)
-    selected_predictions = []
-
-    for a in sorted_p:
-        if len(selected_predictions) > max_boxes:
-            break
-
-        should_select = True
-
-        for b in selected_predictions:
-            if iou(a[3], b[3]) > iou_threshold:
-                should_select = False
-                break
-
-        if should_select:
-            selected_predictions.append(a)
-
-    return selected_predictions
-
-def score_pruning(predictions, width, detection_classes, labels, min_score):
-    """ Prune predictions by score """
-    pruned_predictions = []
-
-    for c in range(0, len(detection_classes[0])):
-        pruned_predictions.append([])
-
-        for r in range(0, len(predictions)):
-            score = 1. / (1. + math.exp(-detection_classes[r][c]))
-
-            if score > min_score:
-                rect = (predictions[r][1] * width, predictions[r][0] * width, \
-                predictions[r][3] * width, predictions[r][2] * width)
-
-                pruned_predictions[c].append((detection_classes[r][c], r, labels[c], rect))
-
-    return pruned_predictions
-
-def nms_pruning(predictions, iou_threshold, max_boxes):
-    """ Prune via non-max suppression """
-    pruned_predictions = []
-
-    for c in range(0, len(predictions)):
-        predictions_for_class = predictions[c]
-        suppressed_predictions = non_max_suppression(
-                predictions_for_class, iou_threshold, max_boxes)
-        pruned_predictions += suppressed_predictions
-
-    return pruned_predictions
-
 def load_labels(filename):
     """
     Load labels from the label file
 
     Note: this is not the tf_label_map.pbtxt, instead just one label per line.
-    Must have a ??? line at the beginning for unknown label.
     """
     labels = []
 
@@ -185,29 +63,156 @@ def load_labels(filename):
 
     return labels
 
-class TFLiteObjectDetector:
+def detection_results(boxes, classes, scores, img_width, img_height,
+        labels, min_score):
+    """ Get readable results and apply min score threshold """
+    detections = []
+    scores_above_threshold = np.where(scores > min_score)[1]
+
+    for s in scores_above_threshold:
+        bb = boxes[0,s,:]
+        sc = scores[0,s]
+        cl = classes[0,s]
+
+        detections.append({
+            "label_str": labels[int(cl)],
+            "label_int": cl,
+            "score": sc,
+            "xmin": int((img_width-1) * bb[1]),
+            "ymin": int((img_height-1) * bb[0]),
+            "xmax": int((img_width-1) * bb[3]),
+            "ymax": int((img_height-1) * bb[2]),
+        })
+
+    return detections
+
+def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8)):
+    """ For debugging, show the image with the bounding boxes """
+    if len(detections) == 0:
+        return
+
+    fig, ax = plt.subplots(1, figsize=debug_image_size)
+
+    for r in detections:
+        print(r)
+
+        if show_image:
+            topleft = (r["xmin"], r["ymin"])
+            width = r["xmax"] - r["xmin"]
+            height = r["ymax"] - r["ymin"]
+
+            rect = patches.Rectangle(topleft, width, height, \
+                linewidth=1, edgecolor='r', facecolor='none')
+
+            # Add the patch to the Axes
+            ax.add_patch(rect)
+            ax.text(r["xmin"], r["ymin"], r["label_str"]+": %.2f"%r["score"], fontsize=6,
+                bbox=dict(facecolor="y", edgecolor="y", alpha=0.5))
+
+            ax.imshow(image_np)
+            plt.show()
+
+class TFObjectDetector:
     """
-    Object Detection with TensorFlow via their models/research/object_detection
+    Object Detection with TensorFlow model trained with
+    models/research/object_detection (Non-TF Lite version)
 
     Based on:
     https://github.com/tensorflow/models/blob/master/research/object_detection/object_detection_tutorial.ipynb
 
+    Usage:
+        with TFObjectDetector("path/to/model_dir.pb", "path/to/labels.txt", 0.5)
+            detections = d.process(newImage, orig_img_width, orig_img_height)
+    """
+    def __init__(self, graph_path, labels_path, min_score, memory=0.9, width=300, height=300):
+        # Prune based on score
+        self.min_score = min_score
+
+        # Model dimensions
+        self.model_input_height = height
+        self.model_input_width = width
+
+        # Max memory usage (0 - 1)
+        self.memory = memory
+
+        # Load frozen TensorFlow model into memory
+        self.detection_graph = tf.Graph()
+
+        with self.detection_graph.as_default():
+            od_graph_def = tf.GraphDef()
+
+            with tf.gfile.GFile(os.path.join(graph_path, "frozen_inference_graph.pb"), 'rb') as fid:
+                serialized_graph = fid.read()
+                od_graph_def.ParseFromString(serialized_graph)
+                tf.import_graph_def(od_graph_def, name='')
+
+        # Load label map -- index starts with 1 for the non-TF Lite version
+        self.labels = ["???"] + load_labels(labels_path)
+
+    def open(self):
+        # Config options: max GPU memory to use.
+        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=self.memory)
+        config = tf.ConfigProto(gpu_options=gpu_options)
+
+        # Session
+        self.session = tf.Session(graph=self.detection_graph, config=config)
+
+        #
+        # Inputs/outputs to network
+        #
+        # Definite input and output Tensors for detection_graph
+        self.image_tensor = self.detection_graph.get_tensor_by_name('image_tensor:0')
+        # Each box represents a part of the image where a particular object was detected.
+        self.detection_boxes = self.detection_graph.get_tensor_by_name('detection_boxes:0')
+        # Each score represent how level of confidence for each of the objects.
+        # Score is shown on the result image, together with the class label.
+        self.detection_scores = self.detection_graph.get_tensor_by_name('detection_scores:0')
+        self.detection_classes = self.detection_graph.get_tensor_by_name('detection_classes:0')
+        self.num_detections = self.detection_graph.get_tensor_by_name('num_detections:0')
+
+    def model_input_dims(self):
+        """ Get desired model input dimensions """
+        return (self.model_input_width, self.model_input_height)
+
+    def close(self):
+        self.session.close()
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+
+    def process(self, image_np, img_width, img_height, input_mean=127.5, input_std=127.5):
+        # Expand dimensions since the model expects images to have shape: [1, None, None, 3]
+        image_np_expanded = np.expand_dims(image_np, axis=0)
+
+        # Run detection
+        (boxes, scores, classes, num) = self.session.run(
+            [self.detection_boxes, self.detection_scores,
+                self.detection_classes, self.num_detections],
+            feed_dict={self.image_tensor: image_np_expanded})
+
+        # Make results readable
+        return detection_results(boxes, classes, scores,
+                img_width, img_height, self.labels, self.min_score)
+
+class TFLiteObjectDetector:
+    """
+    Object Detection with TensorFlow model trained with
+    models/research/object_detection (TF Lite version)
+
+    Based on:
+    https://github.com/tensorflow/models/blob/master/research/object_detection/object_detection_tutorial.ipynb
 
     Usage:
-        with TFLiteObjectDetector("path/to/model_file.tflite", "path/to/tf_label_map.pbtxt") as detector:
-            boxes, scores, classes = detector.process(newImage)
-
-    Or:
-        detector = TFLiteObjectDetector("path/to/model_file.tflite", "path/to/tf_label_map.pbtxt")
-        detector.open()
-        boxes, scores, classes = detector.process(newImage)
-        detector.close()
+        d = TFLiteObjectDetector("path/to/model_file.tflite", "path/to/tf_label_map.pbtxt", 0.5)
+        detections = d.process(newImage, orig_img_width, orig_img_height)
     """
-    def __init__(self, model_file, labels_path, box_priors_file, min_score, iou_threshold, max_boxes):
-        # How to prune
+    def __init__(self, model_file, labels_path, min_score):
+        # Prune based on score
         self.min_score = min_score
-        self.iou_threshold = iou_threshold
-        self.max_boxes = max_boxes
 
         # TF Lite model
         self.interpreter = interpreter_wrapper.Interpreter(model_path=model_file)
@@ -215,9 +220,6 @@ class TFLiteObjectDetector:
 
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
-
-        print(self.input_details)
-        print(self.output_details)
 
         if self.input_details[0]['dtype'] == type(np.float32(1.0)):
             self.floating_model = True
@@ -231,15 +233,12 @@ class TFLiteObjectDetector:
         # Load label map
         self.labels = load_labels(labels_path)
 
-        # Load box priors
-        self.box_priors = load_box_priors(box_priors_file)
-
     def model_input_dims(self):
         """ Get desired model input dimensions """
         return (self.model_input_width, self.model_input_height)
 
-    def process(self, image_np, input_mean=127.5, input_std=127.5):
-        # Normalize if floating point (in contrast to quantized)
+    def process(self, image_np, img_width, img_height, input_mean=127.5, input_std=127.5):
+        # Normalize if floating point (but not if quantized)
         if self.floating_model:
             image_np = (np.float32(image_np) - input_mean) / input_std
 
@@ -250,116 +249,68 @@ class TFLiteObjectDetector:
         self.interpreter.set_tensor(self.input_details[0]['index'], image_np_expanded)
 
         # Run
-        start_time = time.time() # TODO remove
         self.interpreter.invoke()
-        finish_time = time.time() # TODO remove
-        print("time spent:", ((finish_time - start_time) * 1000), "ms") # TODO remove
 
         # Get results
-        detection_boxes = self.interpreter.get_tensor(
-            self.output_details[0]['index'])
-        detection_classes = self.interpreter.get_tensor(
-            self.output_details[1]['index'])
-        detection_scores = self.interpreter.get_tensor(
-            self.output_details[2]['index'])
-        num_detections = self.interpreter.get_tensor(
-            self.output_details[3]['index'])
-
-        # TODO remove
-        print("boxes:", detection_boxes)
-        print("classes:", detection_classes)
-        print("scores:", detection_scores)
-        print("num:", num_detections)
-
-        # "squeeze" out the first dimension (of size 1)
-        detection_boxes = np.squeeze(detection_boxes)
-
-        # squeeze the first dimension but add another dimension to the end
-        # since we only have one class
-        detection_classes = np.expand_dims(np.squeeze(detection_classes), axis=1)
+        detection_boxes = self.interpreter.get_tensor(self.output_details[0]['index'])
+        detection_classes = self.interpreter.get_tensor(self.output_details[1]['index'])
+        detection_scores = self.interpreter.get_tensor(self.output_details[2]['index'])
+        num_detections = self.interpreter.get_tensor(self.output_details[3]['index'])
 
         if not self.floating_model:
             box_scale, box_mean = self.output_details[0]['quantization']
             class_scale, class_mean = self.output_details[1]['quantization']
 
-            detection_boxes = (detection_boxes - box_mean * 1.0) * box_scale
-            detection_classes = (detection_classes - class_mean * 1.0) * class_scale
-
-        # Convert from relative to in terms of pixels
-        detection_boxes = decode_center_size_boxes(detection_boxes, self.box_priors)
-
-        # Prune based on score and do non-max suppresion
-        detection_boxes = score_pruning(
-                detection_boxes, self.model_input_width, detection_classes,
-                self.labels, self.min_score)
-        detection_boxes = nms_pruning(detection_boxes, self.iou_threshold, self.max_boxes)
-
-        # Get top-n
-        detection_boxes = sorted(detection_boxes, reverse=True)[:self.max_boxes]
+            # If these are zero, then we end up setting all our results to zero
+            if box_scale != 0:
+                detection_boxes = (detection_boxes - box_mean * 1.0) * box_scale
+            if class_mean != 0:
+                detection_classes = (detection_classes - class_mean * 1.0) * class_scale
 
         # Make results readable
-        detections = []
-
-        for e in detection_boxes:
-            score = 100. / (1. + math.exp(-e[0]))
-            detections.append({
-                "label": e[2],
-                "score": score,
-                "xmin": e[3][1],
-                "ymin": e[3][0],
-                "xmax": e[3][3],
-                "ymax": e[3][2],
-            })
-
-        return detections
-
-    def show(self, image_np, detections, debug_image_size=(12,8)):
-        """
-        For debugging, show the image with the bounding boxes
-        """
-        fig, ax = plt.subplots(1, figsize=debug_image_size)
-
-        for r in detections: 
-            print(r)
-
-            topleft = (r["xmin"], r["ymin"])
-            width = r["xmax"] - r["xmin"]
-            height = r["ymax"] - r["ymin"]
-            score_string = "{0:2.0f}%".format(r["score"])
-
-            rect = patches.Rectangle(topleft, width, height, \
-                linewidth=1, edgecolor='r', facecolor='none')
-
-            # Add the patch to the Axes
-            ax.add_patch(rect)
-            ax.text(r["xmin"], r["ymin"], r["label"]+": "+score_string, fontsize=6,
-                bbox=dict(facecolor="y", edgecolor="y", alpha=0.5))
-
-        ax.imshow(image_np)
-        plt.show()
+        return detection_results(detection_boxes, detection_classes, detection_scores,
+                img_width, img_height, self.labels, self.min_score)
 
 class ObjectDetectorBase:
     """ Wrap detector to calculate FPS """
-    def __init__(self, model_file, labels_path, box_priors_file,
-            min_score=0.01, iou_threshold=0.5, max_boxes=10,
-            average_fps_frames=30, debug=False):
+    def __init__(self, model_file, labels_path, min_score=0.5,
+            average_fps_frames=30, debug=False, lite=True):
         self.debug = debug
-        self.detector = TFLiteObjectDetector(
-            model_file, labels_path, box_priors_file,
-            min_score, iou_threshold, max_boxes)
+        self.lite = lite
+
+        if lite:
+            self.detector = TFLiteObjectDetector(model_file, labels_path, min_score)
+        else:
+            self.detector = TFObjectDetector(model_file, labels_path, min_score)
+
         self.fps = deque(maxlen=average_fps_frames) # compute average FPS over # of frames
         self.fps_start_time = 0
+
+    def open(self):
+        if not self.lite:
+            self.detector.open()
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def close(self):
+        if not self.lite:
+            self.detector.close()
+
+    def __exit__(self, type, value, traceback):
+        self.close()
 
     def avg_fps(self):
         """ Return average FPS over last so many frames (specified in constructor) """
         return sum(list(self.fps))/len(self.fps)
 
-    def process(self, image):
+    def process(self, *args, **kwargs):
         if self.debug:
             # Start timer
             fps = time.time()
 
-        detections = self.detector.process(image)
+        detections = self.detector.process(*args, **kwargs)
 
         if self.debug:
             # End timer
@@ -391,7 +342,7 @@ class LiveObjectDetector(ObjectDetectorBase):
             frame = input_image.array
             frame.setflags(write=1) # not sure what this does?
 
-            detections = self.process(frame)
+            detections = self.process(frame, width, height)
 
             if self.debug:
                 for i, d in enumerate(detections):
@@ -404,27 +355,35 @@ class OfflineObjectDetector(ObjectDetectorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def run(self, test_image_dir):
+    def run(self, test_image_dir, show_image=True):
         test_images = [os.path.join(d, f) for d, f in find_files(test_image_dir)]
 
         for filename in test_images:
-            img = Image.open(filename)
-            img = img.resize(self.detector.model_input_dims())
-            img = load_image_into_numpy_array(img)
+            orig_img = Image.open(filename)
+            resize_img = orig_img.resize(self.detector.model_input_dims())
 
-            detections = self.process(img)
+            orig_img = load_image_into_numpy_array(orig_img)
+            resize_img = load_image_into_numpy_array(resize_img)
+
+            detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0])
 
             if self.debug:
-                self.detector.show(img, detections)
+                detection_show(orig_img, detections, show_image)
 
 if __name__ == "__main__":
     debug = True
     live = False
 
-    # What model and labels to use
-    model_file = "detect.tflite"
+    # What model
+    lite = True
+    #model_file = "detect_quantized.tflite"
+    model_file = "detect_float.tflite"
+
+    #lite = False
+    #model_file = "exported_models.graph"
+
+    # Labels
     label_map = "labels.txt"
-    box_priors_file = "box_priors.txt"
 
     # Live options
     width = 640
@@ -436,8 +395,8 @@ if __name__ == "__main__":
 
     # Run detection
     if live:
-        d = LiveObjectDetector(model_file, label_map, box_priors_file, debug=debug)
-        d.run(width, height, framerate)
+        with LiveObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
+            d.run(width, height, framerate)
     else:
-        d = OfflineObjectDetector(model_file, label_map, box_priors_file, debug=debug)
-        d.run(offline_image_dir)
+        with OfflineObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
+            d.run(offline_image_dir, show_image=True)
