@@ -1,0 +1,4 @@
+test_images/
+test/
+*.tflite
+*.zip
