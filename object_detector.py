@@ -13,6 +13,7 @@ https://github.com/freedomtan/tensorflow/blob/deeplab_tflite_python/tensorflow/c
 """
 import os
 import time
+import zmq
 import numpy as np
 import tensorflow as tf
 from collections import deque
@@ -26,7 +27,7 @@ try:
     from picamera import PiCamera
     from picamera.array import PiRGBArray
 except ImportError:
-    print("Warning: cannot import picamera, will only work in offline mode")
+    print("Warning: cannot import picamera, live mode won't work")
 
 def load_image_into_numpy_array(image):
     """
@@ -92,7 +93,8 @@ def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8
         return
 
     if show_image:
-        fig, ax = plt.subplots(1, figsize=debug_image_size)
+        plt.ion()
+        fig, ax = plt.subplots(1, figsize=debug_image_size, num=1)
 
     for r in detections:
         print(r)
@@ -110,8 +112,10 @@ def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8
             ax.text(r["xmin"], r["ymin"], r["label_str"]+": %.2f"%r["score"], fontsize=6,
                 bbox=dict(facecolor="y", edgecolor="y", alpha=0.5))
 
-            ax.imshow(image_np)
-            plt.show()
+    if show_image:
+        ax.imshow(image_np)
+        fig.canvas.flush_events()
+        #plt.pause(0.05)
 
 class TFObjectDetector:
     """
@@ -331,30 +335,59 @@ class ObjectDetectorBase:
     def run(self):
         raise NotImplemented("Must implement run() function")
 
+class RemoteObjectDetector(ObjectDetectorBase):
+    """ Run object detection on images streamed from a remote camera """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def run(self, host, port, show_image=False):
+        while True:
+            try:
+                context = zmq.Context()
+                socket = context.socket(zmq.SUB)
+                socket.setsockopt(zmq.SNDHWM, 1)
+                socket.setsockopt(zmq.RCVHWM, 1)
+                socket.setsockopt(zmq.CONFLATE, 1) # Only get last message
+                socket.setsockopt_string(zmq.SUBSCRIBE, np.unicode(''))
+                socket.connect("tcp://"+host+":"+str(port))
+
+                while socket:
+                    frame = socket.recv_pyobj()
+                    detections = self.process(frame, frame.shape[1], frame.shape[0])
+
+                    if self.debug:
+                        for i, d in enumerate(detections):
+                            print("Result "+str(i)+":", d)
+
+                        detection_show(frame, detections, show_image)
+
+                time.sleep(0.5)
+            except KeyboardInterrupt:
+                break
+
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def run(self, width, height, framerate):
+    def run(self, capture_width, capture_height, framerate):
         camera = PiCamera()
-        camera.resolution = (width, height)
+        camera.resolution = (capture_width, capture_height)
         camera.framerate = framerate
-        rawCapture = PiRGBArray(camera, size=(width, height))
+        raw_capture = PiRGBArray(camera, size=self.detector.model_input_dims())
 
         for input_image in camera.capture_continuous(
-                rawCapture, format="bgr", use_video_port=True,
+                raw_capture, format="rgb", use_video_port=True,
                 resize=self.detector.model_input_dims()):
             frame = input_image.array
             frame.setflags(write=1) # not sure what this does?
 
-            detections = self.process(frame, width, height)
+            detections = self.process(frame, frame.shape[1], frame.shape[0])
+            raw_capture.truncate(0)
 
             if self.debug:
                 for i, d in enumerate(detections):
                     print("Result "+str(i)+":", d)
-
-            rawCapture.truncate(0) # Needed?
 
 class OfflineObjectDetector(ObjectDetectorBase):
     """ Run object detection on already captured images """
@@ -378,7 +411,7 @@ class OfflineObjectDetector(ObjectDetectorBase):
 
 if __name__ == "__main__":
     debug = True
-    live = False
+    method = "remote" # remote, live, or offline
 
     # What model
     lite = True
@@ -400,7 +433,10 @@ if __name__ == "__main__":
     offline_image_dir = "test_images"
 
     # Run detection
-    if live:
+    if method == "remote":
+        with RemoteObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
+            d.run("rpi-zero", 5555, show_image=False)
+    elif method == "live":
         with LiveObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
             d.run(width, height, framerate)
     else:
