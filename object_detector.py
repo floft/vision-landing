@@ -91,7 +91,8 @@ def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8
     if len(detections) == 0:
         return
 
-    fig, ax = plt.subplots(1, figsize=debug_image_size)
+    if show_image:
+        fig, ax = plt.subplots(1, figsize=debug_image_size)
 
     for r in detections:
         print(r)
@@ -184,8 +185,9 @@ class TFObjectDetector:
     def __exit__(self, type, value, traceback):
         self.close()
 
-    def process(self, image_np, img_width, img_height, input_mean=127.5, input_std=127.5):
-        # Expand dimensions since the model expects images to have shape: [1, None, None, 3]
+    def process(self, image_np, img_width, img_height):
+        # Expand dimensions since the model expects images to have shape:
+        #   [1, None, None, 3]
         image_np_expanded = np.expand_dims(image_np, axis=0)
 
         # Run detection
@@ -242,14 +244,18 @@ class TFLiteObjectDetector:
         if self.floating_model:
             image_np = (np.float32(image_np) - input_mean) / input_std
 
-        # Expand dimensions since the model expects images to have shape: [1, None, None, 3]
+        # Expand dimensions since the model expects images to have shape:
+        #   [1, None, None, 3]
         image_np_expanded = np.expand_dims(image_np, axis=0)
 
         # Pass image to the network
         self.interpreter.set_tensor(self.input_details[0]['index'], image_np_expanded)
 
         # Run
+        t = time.time()
         self.interpreter.invoke()
+        t = time.time() - t
+        print("Time:", t, "s")
 
         # Get results
         detection_boxes = self.interpreter.get_tensor(self.output_details[0]['index'])
@@ -376,8 +382,8 @@ if __name__ == "__main__":
 
     # What model
     lite = True
-    #model_file = "detect_quantized.tflite"
-    model_file = "detect_float.tflite"
+    model_file = "detect_quantized.tflite"
+    #model_file = "detect_float.tflite"
 
     #lite = False
     #model_file = "exported_models.graph"
@@ -399,4 +405,4 @@ if __name__ == "__main__":
             d.run(width, height, framerate)
     else:
         with OfflineObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
-            d.run(offline_image_dir, show_image=True)
+            d.run(offline_image_dir, show_image=False)
