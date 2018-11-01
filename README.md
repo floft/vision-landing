@@ -5,15 +5,19 @@ Use the model learned from the
 code and now run that on live RPi Zero camera input. We want to get the
 drone to land on the frying pan.
 
+*Warning:* this code is still in development and not fully functional.
+
 # Running Object Detection on RPi
-I will assume you've aliased your RPi Zero to be "rpiz" in your *.ssh/config* file:
+I will assume you've aliased your RPi Zero to be "rpiz" in your *.ssh/config* file.
+First, copy your *detect_quantized.tflite* or whatever model you want to use to your
+Raspberry Pi.
 
     sudo apt install python3-matplotlib python3-pil
     sudo pip3 install tensorflow
     rsync -Pahuv ./ rpiz:vision-landing/
 
     ssh rpiz
-    ./vision-landing/object_detection.py
+    ./vision-landing/object_detection.py --live
 
 # Running Object Detection on another computer
 Since the Zero is really slow, I'll stream to another computer to do processing
@@ -31,4 +35,4 @@ On Pi:
 
 On laptop:
 
-    ./vision-landing/object_detection.py
+    ./vision-landing/object_detection.py --remote --host rpi-zero

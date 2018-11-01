@@ -14,6 +14,7 @@ https://github.com/freedomtan/tensorflow/blob/deeplab_tflite_python/tensorflow/c
 import os
 import time
 import zmq
+import argparse
 import numpy as np
 import tensorflow as tf
 from collections import deque
@@ -87,7 +88,7 @@ def detection_results(boxes, classes, scores, img_width, img_height,
 
     return detections
 
-def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8)):
+def detection_show(image_np, detections, debug=True, show_image=True, debug_image_size=(12,8)):
     """ For debugging, show the image with the bounding boxes """
     if len(detections) == 0:
         return
@@ -97,7 +98,8 @@ def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8
         fig, ax = plt.subplots(1, figsize=debug_image_size, num=1)
 
     for r in detections:
-        print(r)
+        if debug:
+            print(r)
 
         if show_image:
             topleft = (r["xmin"], r["ymin"])
@@ -256,10 +258,7 @@ class TFLiteObjectDetector:
         self.interpreter.set_tensor(self.input_details[0]['index'], image_np_expanded)
 
         # Run
-        t = time.time()
         self.interpreter.invoke()
-        t = time.time() - t
-        print("Time:", t, "s")
 
         # Get results
         detection_boxes = self.interpreter.get_tensor(self.output_details[0]['index'])
@@ -359,7 +358,7 @@ class RemoteObjectDetector(ObjectDetectorBase):
                         for i, d in enumerate(detections):
                             print("Result "+str(i)+":", d)
 
-                        detection_show(frame, detections, show_image)
+                    detection_show(frame, detections, self.debug, show_image)
 
                 time.sleep(0.5)
             except KeyboardInterrupt:
@@ -406,39 +405,67 @@ class OfflineObjectDetector(ObjectDetectorBase):
 
             detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0])
 
-            if self.debug:
-                detection_show(orig_img, detections, show_image)
+            detection_show(orig_img, detections, self.debug, show_image)
 
 if __name__ == "__main__":
-    debug = True
-    method = "remote" # remote, live, or offline
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="detect_quantized.tflite", type=str,
+        help="Model file (if TF lite) or directory (if graph) (default detect_quantized.tflite)")
+    parser.add_argument("--labels", default="labels.txt", type=str,
+        help="Label file (one per line) (default labels.txt")
 
-    # What model
-    lite = True
-    model_file = "detect_quantized.tflite"
-    #model_file = "detect_float.tflite"
+    parser.add_argument("--images", default="test_images", type=str,
+        help="If offline, directory of test .jpg images (default test_images/)")
+    parser.add_argument("--host", default="rpi-zero", type=str,
+        help="Hostname to connect to if in remote mode (default rpi-zero)")
+    parser.add_argument("--port", default=5555, type=int,
+        help="Port to connect to if in remote mode (default 5555)")
 
-    #lite = False
-    #model_file = "exported_models.graph"
+    parser.add_argument("--remote", dest='remote', action='store_true',
+        help="Run detection on remote streamed video")
+    parser.add_argument("--no-remote", dest='remote', action='store_false',
+        help="Do not run detection on remote streamed video (default)")
 
-    # Labels
-    label_map = "labels.txt"
+    parser.add_argument("--live", dest='live', action='store_true',
+        help="Run detection on local live camera video")
+    parser.add_argument("--no-live", dest='live', action='store_false',
+        help="Do not run detection on local live camera video (default)")
 
-    # Live options
-    width = 640
-    height = 480
-    framerate = 10
+    parser.add_argument("--offline", dest='offline', action='store_true',
+        help="Run detection on --images directory of test images")
+    parser.add_argument("--no-offline", dest='offline', action='store_false',
+        help="Do not run detection on directory of test images (default)")
 
-    # Non-live (offline) options -- the images to test
-    offline_image_dir = "test_images"
+    parser.add_argument("--show", dest='show', action='store_true',
+        help="Show image with detection results")
+    parser.add_argument("--no-show", dest='show', action='store_false',
+        help="Do not show image with detection results (default)")
+
+    parser.add_argument("--lite", dest='lite', action='store_true',
+        help="Use TF Lite (default)")
+    parser.add_argument("--no-lite", dest='lite', action='store_false',
+        help="Do not use TF Lite")
+
+    parser.add_argument("--debug", dest='debug', action='store_true',
+        help="Output debug information (fps and detection results) (default) ")
+    parser.add_argument("--no-debug", dest='debug', action='store_false',
+        help="Do not output debug information ")
+
+    parser.set_defaults(
+        remote=False, live=False, offline=False,
+        lite=True, show=False, debug=False)
+    args = parser.parse_args()
+
+    assert args.remote + args.live + args.offline == 1, \
+        "Must specify exactly one of --remote, --live, or --offline"
 
     # Run detection
-    if method == "remote":
-        with RemoteObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
-            d.run("rpi-zero", 5555, show_image=False)
-    elif method == "live":
-        with LiveObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
-            d.run(width, height, framerate)
-    else:
-        with OfflineObjectDetector(model_file, label_map, debug=debug, lite=lite) as d:
-            d.run(offline_image_dir, show_image=False)
+    if args.remote:
+        with RemoteObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
+            d.run(args.host, args.port, show_image=args.show)
+    elif args.live:
+        with LiveObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
+            d.run(640, 480, 15)
+    elif args.offline:
+        with OfflineObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
+            d.run(args.images, show_image=args.show)
