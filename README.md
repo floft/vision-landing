@@ -5,7 +5,7 @@ Use the model learned from the
 code and now run that on live RPi Zero camera input. We want to get the
 drone to land on the frying pan.
 
-*Warning:* this code is still in development and not fully functional.
+**Warning:** this code is still in development and not fully functional.
 
 # Running Object Detection on RPi
 I will assume you've aliased your RPi Zero to be "rpiz" in your *.ssh/config* file.
