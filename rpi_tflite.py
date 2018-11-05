@@ -13,6 +13,8 @@ import tflite.ReshapeOptions
 import tflite.SubGraph
 import tflite.Model
 
+from ..image import find_files, load_image_into_numpy_array
+
 def get_model(filename):
     """ Get .tflite model from the FlatBuffer file """
     with open(filename, "rb") as f:
@@ -293,6 +295,40 @@ def display_model(model):
         t = tensors[o]
         print(o, t)
 
+def run_model(model):
+    """ For debugging, output the model """
+    ops = get_ops(model)
+    bufs = get_bufs(model)
+    graph = get_graph(model)
+    tensors = get_tensors(graph)
+    operators = get_operators(graph)
+
+    inputs = graph.InputsAsNumpy()
+    outputs = graph.OutputsAsNumpy()
+
+    print("Inputs")
+    for i in inputs:
+        t = tensors[i]
+        print(i, t)
+
+    print("Operators")
+    for o in operators:
+        print(o)
+        
+        for t in o["inputs"]:
+            print(" in: ", t, tensors[t])
+        for t in o["outputs"]:
+            print(" out: ", t, tensors[t])
+
+    print("Outputs")
+    for o in outputs:
+        t = tensors[o]
+        print(o, t)
+
 if __name__ == "__main__":
     model = get_model("../detect_quantized.tflite")
     display_model(model)
+
+    test_image_dir = "../test_images"
+    test_images = [os.path.join(d, f) for d, f in find_files(test_image_dir)]
+    print(test_images)
