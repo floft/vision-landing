@@ -5,3 +5,4 @@ test/
 *.zip
 calibration*/
 *.npy
+__pycache__/
