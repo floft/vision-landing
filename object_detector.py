@@ -226,7 +226,8 @@ class TFLiteObjectDetector:
         """ Get desired model input dimensions """
         return (self.model_input_width, self.model_input_height)
 
-    def process(self, image_np, img_width, img_height, input_mean=127.5, input_std=127.5):
+    def process(self, image_np, img_width, img_height, input_mean=127.5, input_std=127.5,
+            output_numpy_concat=False):
         # Normalize if floating point (but not if quantized)
         if self.floating_model:
             image_np = (np.float32(image_np) - input_mean) / input_std
@@ -246,6 +247,13 @@ class TFLiteObjectDetector:
         detection_classes = self.interpreter.get_tensor(self.output_details[1]['index'])
         detection_scores = self.interpreter.get_tensor(self.output_details[2]['index'])
         num_detections = self.interpreter.get_tensor(self.output_details[3]['index'])
+
+        num_detections = self.interpreter.get_tensor(self.output_details[3]['index'])
+
+        if output_numpy_concat:
+            np.save("tflite_official.npy", {
+                self.interpreter._get_tensor_details(i)["name"]: self.interpreter.get_tensor(i) for i in range(176)
+            })
 
         if not self.floating_model:
             box_scale, box_mean = self.output_details[0]['quantization']
@@ -377,14 +385,15 @@ class OfflineObjectDetector(ObjectDetectorBase):
     def run(self, test_image_dir, show_image=True):
         test_images = [os.path.join(d, f) for d, f in find_files(test_image_dir)]
 
-        for filename in test_images:
+        for i, filename in enumerate(test_images):
             orig_img = Image.open(filename)
             resize_img = orig_img.resize(self.detector.model_input_dims())
 
             orig_img = load_image_into_numpy_array(orig_img)
             resize_img = load_image_into_numpy_array(resize_img)
 
-            detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0])
+            detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0],
+                    output_numpy_concat=(self.debug and i == 0))
 
             detection_show(orig_img, detections, self.debug, show_image)
 

@@ -3,6 +3,7 @@
 Run TF Lite model using numpy rather than the TensorFlow TF Lite implementation
 """
 import os
+import copy
 import flatbuffers
 import numpy as np
 from PIL import Image
@@ -26,15 +27,18 @@ class Concat:
         return "Concat"
 
     def __call__(self, inputs, options):
-        return np.concatenate(inputs, options["axis"])
+        return np.concatenate(inputs, options["axis"]).astype(options["out_type"])
 
 class Reshape:
     def __repr__(self):
         return "Reshape"
 
     def __call__(self, inputs, options):
-        assert len(inputs) == 1, "Reshape assumes single input"
-        return np.reshape(inputs[0], options["shape"])
+        assert len(inputs) == 2, \
+            "Reshape takes tensor and shape as input"
+        assert all(inputs[1] == options["shape"]), \
+            "inputs[1] != options[\"shape\"]"
+        return np.reshape(inputs[0], options["shape"]).astype(options["out_type"])
 
 class Logistic:
     def __repr__(self):
@@ -42,7 +46,106 @@ class Logistic:
 
     def __call__(self, inputs, options):
         assert len(inputs) == 1, "Logistic assumes single input"
-        return 1 / (1 + np.exp(-inputs[0]))
+        return (1 / (1 + np.exp(-inputs[0]))).astype(options["out_type"])
+
+class TFLite_Detection_PostProcess:
+    def __repr__(self):
+        return "TFLite_Detection_PostProcess"
+
+    def __call__(self, inputs, options):
+        raise NotImplementedError("TFLite_Detection_PostProcess")
+
+def zero_pad(x, pad):
+    """
+    Input: x (batch_size, n_H, n_W, n_C), padding amount
+    Output: (m, n_H + 2*pad, n_W + 2*pad, n_C)
+    """
+    # Not an integer, must have different padding on either side
+    if int(pad) != pad:
+        pad1 = int(np.ceil(pad))
+        pad2 = int(np.floor(pad))
+        #pad1 = int(np.floor(pad))
+        #pad2 = int(np.ceil(pad))
+
+        return np.pad(x, ((0,0), (pad1,pad2), (pad1,pad2), (0,0)), 'constant')
+
+    # Integer, meaning we can have same padding on both sides
+    else:
+        pad = int(pad)
+        return np.pad(x, ((0,0), (pad,pad), (pad,pad), (0,0)), 'constant')
+
+def conv(x, w, b):
+    """ x (f, f, n_C), W (f, f, n_C_prev), b (scalar) """
+    return np.sum(np.multiply(x, w)) + b
+
+def conv2d(x, W, b, stride, pad, out_type):
+    """
+    Input: x (m, n_H_prev, n_W_prev, n_C_prev), W (f, f, n_C_prev, n_C), b (1, 1, 1, n_C)
+    Output: (m, n_H, n_W, n_C)
+    """
+    (m, n_H_prev, n_W_prev, n_C_prev) = x.shape
+    (n_C, f, f, n_C_prev) = W.shape
+
+    # Dimensions of output volume
+    n_H = int((n_H_prev-f+2*pad)/stride)+1
+    n_W = int((n_W_prev-f+2*pad)/stride)+1
+
+    # Init output with zeros
+    output = np.zeros((m,n_H,n_W,n_C), dtype=out_type)
+    # Pad input
+    A_prev_pad = zero_pad(x, pad)
+
+    for i in range(m): # over batches (probably only 1)
+        a_prev_pad = A_prev_pad[i,:,:,:]
+        for h in range(n_H):         # vertical axis
+            for w in range(n_W):     # horiz axis
+                for c in range(n_C): # for each output filter
+                    # Portion of image for input to convolution
+                    a_slice_prev = a_prev_pad[h*stride:h*stride+f, w*stride:w*stride+f, :]
+                    # Convolve
+                    assert len(b.shape) == 1, "Assuming single bias per channel/filter"
+                    output[i, h, w, c] = conv(a_slice_prev, W[c,:,:,:], b[c])
+
+    assert output.shape == (m, n_H, n_W, n_C), "Incorrect output shape"
+    return output
+
+def depthwise_conv2d(x, W, b, stride, pad, out_type):
+    """
+    See "MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications"
+        https://arxiv.org/pdf/1704.04861.pdf
+
+    Note: this does not do the 1x1 step afterward. The graph appears to have a
+    separate conv2d that does the 1x1's.
+
+    Input: x (m, n_H_prev, n_W_prev, n_C_prev), W (f, f, n_C_prev, n_C), b (1, 1, 1, n_C)
+    Output: (m, n_H, n_W, n_C_prev)
+    """
+    (m, n_H_prev, n_W_prev, n_C_prev) = x.shape
+    (n_C, f, f, n_C_prev) = W.shape
+
+    # Dimensions of output volume
+    n_H = int((n_H_prev-f+2*pad)/stride)+1
+    n_W = int((n_W_prev-f+2*pad)/stride)+1
+
+    # Init output with zeros
+    output = np.zeros((m,n_H,n_W,n_C_prev), dtype=out_type)
+    # Pad input
+    A_prev_pad = zero_pad(x, pad)
+
+    for i in range(m): # over batches (probably only 1)
+        a_prev_pad = A_prev_pad[i,:,:,:]
+        for h in range(n_H):         # vertical axis
+            for w in range(n_W):     # horiz axis
+                for c in range(n_C_prev): # for each output filter
+                    # Portion of image for input to convolution
+                    a_slice_prev = a_prev_pad[h*stride:h*stride+f, w*stride:w*stride+f, c]
+                    # Convolve
+                    assert W.shape[0] == 1, "Assuming W.shape[0] == 1"
+                    assert len(b.shape) == 1, "Assuming single bias per channel/filter"
+                    output[i, h, w, c] = conv(a_slice_prev, W[0,:,:,c], b[c])
+
+    assert output.shape == (m, n_H, n_W, n_C_prev), "Incorrect output shape"
+    return output
 
 class Conv2D:
     def __repr__(self):
@@ -54,10 +157,24 @@ class Conv2D:
         weights = inputs[1]
         biases = inputs[2]
         activation = options["activation"]
-        padding = options["padding"]
         stride = options["stride"]
 
-        raise NotImplementedError("Conv2D")
+        print("Input shape:", input_data.shape)
+        print("Weights shape:", weights.shape)
+        print("Output shape:", options["out_shape"])
+
+        n = input_data.shape[1] # width (or height, since same)
+        f = weights.shape[1] # fxf filter
+        padding = options["padding"](n, f, stride)
+
+        print("Padding:", padding)
+
+        result = conv2d(input_data, weights, biases, stride, padding,
+                options["out_type"])
+
+        print("Result shape:", result.shape)
+
+        return activation(result)
 
 class DepthwiseConv2D:
     def __repr__(self):
@@ -69,10 +186,24 @@ class DepthwiseConv2D:
         weights = inputs[1]
         biases = inputs[2]
         activation = options["activation"]
-        padding = options["padding"]
         stride = options["stride"]
 
-        raise NotImplementedError("DepthwiseConv2D")
+        print("Input shape:", input_data.shape)
+        print("Weights shape:", weights.shape)
+        print("Output shape:", options["out_shape"])
+
+        n = input_data.shape[1] # width (or height, since same)
+        f = weights.shape[1] # fxf filter
+        padding = options["padding"](n, f, stride)
+
+        print("Padding:", padding)
+
+        result = depthwise_conv2d(input_data, weights, biases, stride, padding,
+                options["out_type"])
+
+        print("Result shape:", result.shape)
+
+        return activation(result)
 
 class ActivationNone:
     def __repr__(self):
@@ -86,7 +217,23 @@ class ActivationRELU6:
         return "ActivationRELU6"
 
     def __call__(self, inputs):
-        raise NotImplementedError("ActivationRELU6")
+        return np.minimum(np.maximum(inputs, 0), 6)
+
+class PaddingSame:
+    def __repr__(self):
+        return "PaddingSame"
+
+    def __call__(self, n, f, s):
+        # SAME with s=2 apparently doesn't actually keep it the same size
+        #return (n*(s-1)+f-s)/2
+        return (f-1)/2
+
+class PaddingValid:
+    def __repr__(self):
+        return "PaddingValid"
+
+    def __call__(self, n, f, s):
+        return 0 # No padding
 
 def get_model(filename):
     """ Get .tflite model from the FlatBuffer file """
@@ -120,7 +267,10 @@ def get_op(op):
     elif builtin == tflite.BuiltinOperator.BuiltinOperator.RESHAPE:
         operator = Reshape()
     elif builtin == tflite.BuiltinOperator.BuiltinOperator.CUSTOM:
-        operator = "Custom:" + custom.decode() # This will error at the end...
+        if custom.decode() == "TFLite_Detection_PostProcess":
+            operator = TFLite_Detection_PostProcess()
+        else:
+            raise NotImplementedError("custom op "+custom.decode()+" not implemented")
     else:
         raise NotImplementedError("builtin op "+str(builtin)+" not implemented")
 
@@ -145,9 +295,9 @@ def get_padding(pad):
     padding = None
 
     if pad == tflite.Padding.Padding.SAME:
-        padding = "Same"
+        padding = PaddingSame()
     elif pad == tflite.Padding.Padding.VALID:
-        padding = "Valid"
+        padding = PaddingValid()
     else:
         raise NotImplementedError("padding "+str(pad)+" not implemented")
 
@@ -261,11 +411,11 @@ def get_type(t):
     tensor_type = None
 
     if t == tflite.TensorType.TensorType.FLOAT32:
-        tensor_type = "Float32"
+        tensor_type = np.float32
     elif t == tflite.TensorType.TensorType.INT32:
-        tensor_type = "Int32"
+        tensor_type = np.int32
     elif t == tflite.TensorType.TensorType.UINT8:
-        tensor_type = "Uint8"
+        tensor_type = np.uint8
     else:
         raise NotImplementedError("tensor type "+str(t)+" not implemented")
 
@@ -356,7 +506,10 @@ def display_model(model):
 
     print("Operators")
     for o in operators:
-        print(o)
+        # Make op readable
+        pretty_o = copy.deepcopy(o)
+        pretty_o["op"] = str(ops[pretty_o["op"]])
+        print(pretty_o)
 
         for t in o["inputs"]:
             print(" in: ", t, tensors[t])
@@ -374,7 +527,15 @@ def get_tensors_by_index(tensors, indices):
 
 def get_tensor_buffers(bufs, tensors):
     """ Return a list of buffers of specified by the given tensors """
-    return [bufs[t["buffer"]] for t in tensors]
+    buffers = []
+
+    for t in tensors:
+        # Reinterpret bytes as correct type and reshape
+        buf = bufs[t["buffer"]]
+        buf = np.frombuffer(buf, dtype=t["type"]).reshape(t["shape"])
+        buffers.append(buf)
+
+    return buffers
 
 def run_model(model, input_data):
     """ Run model on given input data """
@@ -405,9 +566,20 @@ def run_model(model, input_data):
         op = ops[operator["op"]]
         options = operator["options"]
 
+        print("Input", tensors[operator["inputs"][0]]["name"], "running op", op)
+
+        # TODO Skipping the custom op for now
+        if isinstance(op, TFLite_Detection_PostProcess):
+            continue
+
+        # We need to know what format to create the result in
+        output_tensor = tensors[operator["outputs"][0]]
+        options["out_type"] = output_tensor["type"]
+        options["out_shape"] = output_tensor["shape"]
+
         # Get input tensors
-        tensors = get_tensors_by_index(tensors, operator["inputs"])
-        inputs = get_tensor_buffers(bufs, tensors)
+        inputs = get_tensor_buffers(bufs,
+            get_tensors_by_index(tensors, operator["inputs"]))
 
         # Run operation
         output_data = op(inputs, options)
@@ -416,20 +588,36 @@ def run_model(model, input_data):
             "Only support single output at the moment"
 
         # Save result to output tensor
-        output_tensor = tensors[operator["outputs"][0]]
         assert all(output_data.shape == output_tensor["shape"]), \
             "Output data must be of shape "+str(output_tensor["shape"])+\
             " but is of shape "+str(output_data.shape)
 
+        bufs[output_tensor["buffer"]] = output_data
+
     # Get output
-    results = []
+    #results = []
 
-    for o in outputs:
-        t = tensors[o]
-        buf = t["buffer"]
-        results.append(buf)
+    #for o in outputs:
+    #    t = tensors[o]
+    #    buf = t["buffer"]
+    #    results.append(buf)
 
-    return results
+    # Get different output: concat and concat_1
+    concat = None
+    concat_1 = None
+
+    for t in tensors:
+        if t["name"] == "concat":
+            concat = bufs[t["buffer"]]
+        elif t["name"] == "concat_1":
+            concat_1 = bufs[t["buffer"]]
+
+    np.save("tflite_manual.npy", {
+        t["name"]: bufs[t["buffer"]] for t in tensors
+    })
+    print("Total number of tensors:", len(tensors))
+
+    #return results
 
 def load_test_image(test_image_dir, width=300, height=300, index=0):
     """ Load one test image """
