@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
+"""
+Run TF Lite model using numpy rather than the TensorFlow TF Lite implementation
+"""
+import os
 import flatbuffers
+import numpy as np
+from PIL import Image
+
 import tflite
 import tflite.TensorType
 import tflite.BuiltinOperator
@@ -12,8 +19,74 @@ import tflite.ConcatenationOptions
 import tflite.ReshapeOptions
 import tflite.SubGraph
 import tflite.Model
+from image import find_files, load_image_into_numpy_array
 
-from ..image import find_files, load_image_into_numpy_array
+class Concat:
+    def __repr__(self):
+        return "Concat"
+
+    def __call__(self, inputs, options):
+        return np.concatenate(inputs, options["axis"])
+
+class Reshape:
+    def __repr__(self):
+        return "Reshape"
+
+    def __call__(self, inputs, options):
+        assert len(inputs) == 1, "Reshape assumes single input"
+        return np.reshape(inputs[0], options["shape"])
+
+class Logistic:
+    def __repr__(self):
+        return "Logistic"
+
+    def __call__(self, inputs, options):
+        assert len(inputs) == 1, "Logistic assumes single input"
+        return 1 / (1 + np.exp(-inputs[0]))
+
+class Conv2D:
+    def __repr__(self):
+        return "Conv2D"
+
+    def __call__(self, inputs, options):
+        assert len(inputs) == 3, "Conv2D assumes three inputs"
+        input_data = inputs[0]
+        weights = inputs[1]
+        biases = inputs[2]
+        activation = options["activation"]
+        padding = options["padding"]
+        stride = options["stride"]
+
+        raise NotImplementedError("Conv2D")
+
+class DepthwiseConv2D:
+    def __repr__(self):
+        return "DepthwiseConv2D"
+
+    def __call__(self, inputs, options):
+        assert len(inputs) == 3, "DepthwiseConv2D assumes three inputs"
+        input_data = inputs[0]
+        weights = inputs[1]
+        biases = inputs[2]
+        activation = options["activation"]
+        padding = options["padding"]
+        stride = options["stride"]
+
+        raise NotImplementedError("DepthwiseConv2D")
+
+class ActivationNone:
+    def __repr__(self):
+        return "ActivationNone"
+
+    def __call__(self, inputs):
+        return inputs
+
+class ActivationRELU6:
+    def __repr__(self):
+        return "ActivationRELU6"
+
+    def __call__(self, inputs):
+        raise NotImplementedError("ActivationRELU6")
 
 def get_model(filename):
     """ Get .tflite model from the FlatBuffer file """
@@ -23,7 +96,7 @@ def get_model(filename):
     model = tflite.Model.Model.GetRootAsModel(buf, 0)
 
     assert model.Version() == 3, \
-        "Only support schema version 3 at the moment" 
+        "Only support schema version 3 at the moment"
     assert model.MetadataBufferLength() == 0, \
         "Do not support metadata_buffer at the moment"
 
@@ -37,20 +110,20 @@ def get_op(op):
     builtin = op.BuiltinCode()
 
     if builtin == tflite.BuiltinOperator.BuiltinOperator.CONCATENATION:
-        operator = "Concat"
+        operator = Concat()
     elif builtin == tflite.BuiltinOperator.BuiltinOperator.CONV_2D:
-        operator = "Conv2D"
+        operator = Conv2D()
     elif builtin == tflite.BuiltinOperator.BuiltinOperator.DEPTHWISE_CONV_2D:
-        operator = "DepthwiseConv2D"
+        operator = DepthwiseConv2D()
     elif builtin == tflite.BuiltinOperator.BuiltinOperator.LOGISTIC:
-        operator = "Logistic"
+        operator = Logistic()
     elif builtin == tflite.BuiltinOperator.BuiltinOperator.RESHAPE:
-        operator = "Reshape"
+        operator = Reshape()
     elif builtin == tflite.BuiltinOperator.BuiltinOperator.CUSTOM:
-        operator = "Custom:" + custom.decode()
+        operator = "Custom:" + custom.decode() # This will error at the end...
     else:
         raise NotImplementedError("builtin op "+str(builtin)+" not implemented")
-    
+
     return operator
 
 def get_activation(act):
@@ -59,9 +132,9 @@ def get_activation(act):
     activation = None
 
     if act == tflite.ActivationFunctionType.ActivationFunctionType.NONE:
-        activation = "None"
+        activation = ActivationNone()
     elif act == tflite.ActivationFunctionType.ActivationFunctionType.RELU6:
-        activation = "RELU6"
+        activation = ActivationRELU6()
     else:
         raise NotImplementedError("activation "+str(act)+" not implemented")
 
@@ -284,7 +357,7 @@ def display_model(model):
     print("Operators")
     for o in operators:
         print(o)
-        
+
         for t in o["inputs"]:
             print(" in: ", t, tensors[t])
         for t in o["outputs"]:
@@ -295,8 +368,16 @@ def display_model(model):
         t = tensors[o]
         print(o, t)
 
-def run_model(model):
-    """ For debugging, output the model """
+def get_tensors_by_index(tensors, indices):
+    """ Return a list of the desired tensors """
+    return [tensors[t] for t in indices]
+
+def get_tensor_buffers(bufs, tensors):
+    """ Return a list of buffers of specified by the given tensors """
+    return [bufs[t["buffer"]] for t in tensors]
+
+def run_model(model, input_data):
+    """ Run model on given input data """
     ops = get_ops(model)
     bufs = get_bufs(model)
     graph = get_graph(model)
@@ -306,29 +387,62 @@ def run_model(model):
     inputs = graph.InputsAsNumpy()
     outputs = graph.OutputsAsNumpy()
 
-    print("Inputs")
-    for i in inputs:
-        t = tensors[i]
-        print(i, t)
+    assert len(inputs) == 1, \
+        "Only supports models with a single input at the moment"
 
-    print("Operators")
-    for o in operators:
-        print(o)
-        
-        for t in o["inputs"]:
-            print(" in: ", t, tensors[t])
-        for t in o["outputs"]:
-            print(" out: ", t, tensors[t])
+    # Set input data
+    input_tensor = tensors[inputs[0]]
 
-    print("Outputs")
+    assert all(input_data.shape == input_tensor["shape"]), \
+        "Input data must be of shape "+str(input_tensor["shape"])+\
+        " but is of shape "+str(input_data.shape)
+
+    bufs[input_tensor["buffer"]] = input_data
+
+    # Execute operations
+    for operator in operators:
+        # What operation to perform
+        op = ops[operator["op"]]
+        options = operator["options"]
+
+        # Get input tensors
+        tensors = get_tensors_by_index(tensors, operator["inputs"])
+        inputs = get_tensor_buffers(bufs, tensors)
+
+        # Run operation
+        output_data = op(inputs, options)
+
+        assert len(operator["outputs"]) == 1, \
+            "Only support single output at the moment"
+
+        # Save result to output tensor
+        output_tensor = tensors[operator["outputs"][0]]
+        assert all(output_data.shape == output_tensor["shape"]), \
+            "Output data must be of shape "+str(output_tensor["shape"])+\
+            " but is of shape "+str(output_data.shape)
+
+    # Get output
+    results = []
+
     for o in outputs:
         t = tensors[o]
-        print(o, t)
+        buf = t["buffer"]
+        results.append(buf)
+
+    return results
+
+def load_test_image(test_image_dir, width=300, height=300, index=0):
+    """ Load one test image """
+    test_images = [os.path.join(d, f) for d, f in find_files(test_image_dir)]
+    img = Image.open(test_images[index])
+    img = img.resize((width, height))
+    img = load_image_into_numpy_array(img)
+    img = np.expand_dims(img, axis=0)
+    return img
 
 if __name__ == "__main__":
-    model = get_model("../detect_quantized.tflite")
+    model = get_model("detect_quantized.tflite")
     display_model(model)
 
-    test_image_dir = "../test_images"
-    test_images = [os.path.join(d, f) for d, f in find_files(test_image_dir)]
-    print(test_images)
+    img = load_test_image("test_images")
+    run_model(model, img)
