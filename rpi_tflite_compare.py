@@ -17,3 +17,7 @@ def official():
 if __name__ == "__main__":
     o = official()
     m = manual()
+    same = lambda t: (m[t] == o[t]).all()
+
+    for t in m.keys():
+        print(t, np.mean(np.abs(m[t] - o[t])))

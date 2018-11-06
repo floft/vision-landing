@@ -253,6 +253,7 @@ class TFLiteObjectDetector:
         if output_numpy_concat:
             np.save("tflite_official.npy", {
                 self.interpreter._get_tensor_details(i)["name"]: self.interpreter.get_tensor(i) for i in range(176)
+                #self.interpreter._get_tensor_details(i)["name"]: np.copy(self.interpreter.tensor(i)()) for i in range(176)
             })
 
         if not self.floating_model:
@@ -392,8 +393,11 @@ class OfflineObjectDetector(ObjectDetectorBase):
             orig_img = load_image_into_numpy_array(orig_img)
             resize_img = load_image_into_numpy_array(resize_img)
 
+            # TODO remove
+            #resize_img = np.ones(resize_img.shape, dtype=np.float32)*255
+
             detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0],
-                    output_numpy_concat=(self.debug and i == 0))
+                    output_numpy_concat=(self.debug and i == len(test_images)-1))
 
             detection_show(orig_img, detections, self.debug, show_image)
 

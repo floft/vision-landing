@@ -6,3 +6,4 @@ test/
 calibration*/
 *.npy
 __pycache__/
+.vscode

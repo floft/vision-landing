@@ -3,10 +3,12 @@
 Run TF Lite model using numpy rather than the TensorFlow TF Lite implementation
 """
 import os
+import sys
 import copy
 import flatbuffers
 import numpy as np
 from PIL import Image
+from enum import Enum
 
 import tflite
 import tflite.TensorType
@@ -20,80 +22,129 @@ import tflite.ConcatenationOptions
 import tflite.ReshapeOptions
 import tflite.SubGraph
 import tflite.Model
+import tflite.QuantizationParameters
 from image import find_files, load_image_into_numpy_array
+
+import tensorflow as tf
+tf.enable_eager_execution()
+
+Padding = Enum("Padding", "VALID SAME")
 
 class Concat:
     def __repr__(self):
         return "Concat"
 
-    def __call__(self, inputs, options):
-        return np.concatenate(inputs, options["axis"]).astype(options["out_type"])
+    def __call__(self, input_tensors, input_buffers, options):
+        return np.concatenate(input_buffers, options["axis"]).astype(options["out_type"])
 
 class Reshape:
     def __repr__(self):
         return "Reshape"
 
-    def __call__(self, inputs, options):
-        assert len(inputs) == 2, \
+    def __call__(self, input_tensors, input_buffers, options):
+        assert len(input_buffers) == 2, \
             "Reshape takes tensor and shape as input"
-        assert all(inputs[1] == options["shape"]), \
-            "inputs[1] != options[\"shape\"]"
-        return np.reshape(inputs[0], options["shape"]).astype(options["out_type"])
+        assert all(input_buffers[1] == options["shape"]), \
+            "input_buffers[1] != options[\"shape\"]"
+        return np.reshape(input_buffers[0], options["shape"]).astype(options["out_type"])
 
 class Logistic:
     def __repr__(self):
         return "Logistic"
 
-    def __call__(self, inputs, options):
-        assert len(inputs) == 1, "Logistic assumes single input"
-        return (1 / (1 + np.exp(-inputs[0]))).astype(options["out_type"])
+    def __call__(self, input_tensors, input_buffers, options):
+        assert len(input_buffers) == 1, "Logistic assumes single input"
+        return (1 / (1 + np.exp(-input_buffers[0]))).astype(options["out_type"])
 
 class TFLite_Detection_PostProcess:
     def __repr__(self):
         return "TFLite_Detection_PostProcess"
 
-    def __call__(self, inputs, options):
+    def __call__(self, input_tensors, input_buffers, options):
         raise NotImplementedError("TFLite_Detection_PostProcess")
 
-def zero_pad(x, pad):
+def zero_pad(x, pad_before_h, pad_after_h, pad_before_w, pad_after_w):
     """
     Input: x (batch_size, n_H, n_W, n_C), padding amount
     Output: (m, n_H + 2*pad, n_W + 2*pad, n_C)
+
+    Apparently "SAME" padding in TF does *not* add padding to the top left at
+    all!? That is not what the TF docs say. They say round down top/left and
+    round up bottom/right.
     """
     # Not an integer, must have different padding on either side
-    if int(pad) != pad:
-        pad1 = int(np.ceil(pad))
-        pad2 = int(np.floor(pad))
-        #pad1 = int(np.floor(pad))
-        #pad2 = int(np.ceil(pad))
-
-        return np.pad(x, ((0,0), (pad1,pad2), (pad1,pad2), (0,0)), 'constant')
-
+    #if int(pad) != pad:
+    #    pad1 = int(np.floor(pad))
+    #    pad2 = int(np.ceil(pad))
+    #
+    #    #return np.pad(x, ((0,0), (pad1,pad2), (pad1,pad2), (0,0)), 'constant')
+    #    return np.pad(x, ((0,0), (0,pad1+pad2), (0,pad1+pad2), (0,0)), 'constant')
     # Integer, meaning we can have same padding on both sides
-    else:
-        pad = int(pad)
-        return np.pad(x, ((0,0), (pad,pad), (pad,pad), (0,0)), 'constant')
+    #else:
+    #    pad = int(pad)
+    #    #return np.pad(x, ((0,0), (pad,pad), (pad,pad), (0,0)), 'constant')
+    #    return np.pad(x, ((0,0), (0,pad*2), (0,pad*2), (0,0)), 'constant')
+    return np.pad(x, ((0,0), (pad_before_h, pad_after_h), (pad_before_w, pad_after_w), (0,0)), 'constant')
 
 def conv(x, w, b):
     """ x (f, f, n_C), W (f, f, n_C_prev), b (scalar) """
-    return np.sum(np.multiply(x, w)) + b
+    return np.sum(np.multiply(x, w)) + float(b)
 
-def conv2d(x, W, b, stride, pad, out_type):
+def conv2d_tf(x, W, b, stride, pad, out_type):
+    """ Check that it's my implementation of this that's the problem """
+    pad_name = pad.name # Get "SAME" or "VALID"
+    return np.array(
+        tf.nn.conv2d(x, W, [1, stride, stride, 1], pad_name) + b,
+    dtype=out_type)
+
+def calc_padding(input_size, filter_size, stride, pad_type):
+    """
+    See:
+    https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/common_shape_fns.cc#L20
+    """
+    if pad_type == Padding.VALID:
+        output_size = int((input_size - filter_size + stride) / stride)
+        print(input_size, filter_size, stride)
+        pad_before = 0
+        pad_after = 0
+    elif pad_type == Padding.SAME:
+        output_size = int((input_size + stride - 1) / stride)
+        pad_needed = max(0, (output_size - 1)*stride + filter_size - input_size)
+        pad_before = pad_needed // 2
+        pad_after = pad_needed - pad_before
+    else:
+        raise NotImplementedError("Only SAME and VALID padding types implemented")
+
+    print("Output size:", output_size, "Pad before:", pad_before, "Pad after:", pad_after)
+    old_calc = int((input_size-filter_size+pad_before+pad_after)/stride)+1
+    if output_size != old_calc:
+        print("Old calc:", old_calc, "New calc:", output_size)
+
+    assert output_size >= 0, "output_size must be non-negative after padding"
+    return output_size, pad_before, pad_after
+
+def conv2d_mine(x, W, b, stride, pad, out_type):
     """
     Input: x (m, n_H_prev, n_W_prev, n_C_prev), W (f, f, n_C_prev, n_C), b (1, 1, 1, n_C)
     Output: (m, n_H, n_W, n_C)
+    https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/conv_ops.cc#L416
     """
     (m, n_H_prev, n_W_prev, n_C_prev) = x.shape
-    (n_C, f, f, n_C_prev) = W.shape
+    (f, f, n_C_prev, n_C) = W.shape
 
     # Dimensions of output volume
-    n_H = int((n_H_prev-f+2*pad)/stride)+1
-    n_W = int((n_W_prev-f+2*pad)/stride)+1
+    #n_H = int((n_H_prev-f+2*pad)/stride)+1
+    #n_W = int((n_W_prev-f+2*pad)/stride)+1
+    #n_H = int(np.ceil((n_H_prev - f + 1) / stride))
+    #n_W = int(np.ceil((n_W_prev - f + 1) / stride))
+
+    # Pad input
+    n_H, pad_before_h, pad_after_h = calc_padding(n_H_prev, f, stride, pad)
+    n_W, pad_before_w, pad_after_w = calc_padding(n_W_prev, f, stride, pad)
+    A_prev_pad = zero_pad(x, pad_before_h, pad_after_h, pad_before_w, pad_after_w)
 
     # Init output with zeros
     output = np.zeros((m,n_H,n_W,n_C), dtype=out_type)
-    # Pad input
-    A_prev_pad = zero_pad(x, pad)
 
     for i in range(m): # over batches (probably only 1)
         a_prev_pad = A_prev_pad[i,:,:,:]
@@ -101,15 +152,48 @@ def conv2d(x, W, b, stride, pad, out_type):
             for w in range(n_W):     # horiz axis
                 for c in range(n_C): # for each output filter
                     # Portion of image for input to convolution
+                    assert h*stride+f <= a_prev_pad.shape[0], "out of bounds"
+                    assert w*stride+f <= a_prev_pad.shape[1], "out of bounds"
                     a_slice_prev = a_prev_pad[h*stride:h*stride+f, w*stride:w*stride+f, :]
                     # Convolve
                     assert len(b.shape) == 1, "Assuming single bias per channel/filter"
-                    output[i, h, w, c] = conv(a_slice_prev, W[c,:,:,:], b[c])
+                    output[i, h, w, c] = conv(a_slice_prev, W[:,:,:,c], b[c])
 
-    assert output.shape == (m, n_H, n_W, n_C), "Incorrect output shape"
+    # https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/kernels/internal/reference/reference_ops.h#L193
+    """
+    for batch in range(m):
+        for out_y in range(n_H):
+            for out_x in range(n_W):
+                for out_channel in range(n_C):
+                    in_x_origin = out_x * stride - int(pad)
+                    in_y_origin = out_y * stride - int(pad)
+                    total = 0.0
+
+                    for filter_y in range(f):
+                        for filter_x in range(f):
+                            in_x = in_x_origin + filter_x
+                            in_y = in_y_origin + filter_y
+
+                            if in_x >= 0 and in_y >= 0 and in_x < n_W_prev and in_y < n_H_prev:
+                                for in_channel in range(n_C_prev):
+                                        input_value = x[batch, in_y, in_x, in_channel]
+                                        filter_value = W[filter_y, filter_x, in_channel, out_channel]
+
+                                        total += input_value * filter_value
+
+                    output[batch, out_y, out_x, out_channel] = total + b[out_channel]
+    """
+
     return output
 
-def depthwise_conv2d(x, W, b, stride, pad, out_type):
+def depthwise_conv2d_tf(x, W, b, stride, pad, out_type):
+    """ Check that it's my implementation of this that's the problem """
+    pad_name = pad.name # Get "SAME" or "VALID"
+    return np.array(
+        tf.nn.depthwise_conv2d(x, W, [1, stride, stride, 1], pad_name) + b,
+    dtype=out_type)
+
+def depthwise_conv2d_mine(x, W, b, stride, pad, out_type):
     """
     See "MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications"
         https://arxiv.org/pdf/1704.04861.pdf
@@ -121,89 +205,113 @@ def depthwise_conv2d(x, W, b, stride, pad, out_type):
     Output: (m, n_H, n_W, n_C_prev)
     """
     (m, n_H_prev, n_W_prev, n_C_prev) = x.shape
-    (n_C, f, f, n_C_prev) = W.shape
+    (f, f, n_C_prev, n_C) = W.shape
+    assert n_C == 1, "first dimension == 1 for depthwise conv2d weights"
 
     # Dimensions of output volume
-    n_H = int((n_H_prev-f+2*pad)/stride)+1
-    n_W = int((n_W_prev-f+2*pad)/stride)+1
+    #n_H = int((n_H_prev-f+2*pad)/stride)+1
+    #n_W = int((n_W_prev-f+2*pad)/stride)+1
+
+    # Pad input
+    n_H, pad_before_h, pad_after_h = calc_padding(n_H_prev, f, stride, pad)
+    n_W, pad_before_w, pad_after_w = calc_padding(n_W_prev, f, stride, pad)
+    A_prev_pad = zero_pad(x, pad_before_h, pad_after_h, pad_before_w, pad_after_w)
 
     # Init output with zeros
     output = np.zeros((m,n_H,n_W,n_C_prev), dtype=out_type)
-    # Pad input
-    A_prev_pad = zero_pad(x, pad)
 
     for i in range(m): # over batches (probably only 1)
         a_prev_pad = A_prev_pad[i,:,:,:]
         for h in range(n_H):         # vertical axis
             for w in range(n_W):     # horiz axis
-                for c in range(n_C_prev): # for each output filter
+                for c in range(n_C_prev): # for each output filter (same as # of input filters)
                     # Portion of image for input to convolution
                     a_slice_prev = a_prev_pad[h*stride:h*stride+f, w*stride:w*stride+f, c]
                     # Convolve
-                    assert W.shape[0] == 1, "Assuming W.shape[0] == 1"
+                    assert W.shape[3] == 1, "Assuming W.shape[3] == 1"
                     assert len(b.shape) == 1, "Assuming single bias per channel/filter"
-                    output[i, h, w, c] = conv(a_slice_prev, W[0,:,:,c], b[c])
+                    output[i, h, w, c] = conv(a_slice_prev, W[:,:,c,0], b[c])
 
-    assert output.shape == (m, n_H, n_W, n_C_prev), "Incorrect output shape"
     return output
 
-class Conv2D:
+class Conv:
+    """ Base class for Conv2D and DepthwiseConv2D, which are almost the same
+    but call slightly different functions """
+    def __repr__(self):
+        raise NotImplementedError
+
+    def eval(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def __call__(self, input_tensors, input_buffers, options):
+        assert len(input_buffers) == 3, str(self)+" assumes three inputs"
+
+        input_data = input_buffers[0]
+        weights = input_buffers[1]
+        weights = np.transpose(weights, (1,2,3,0)) # TODO transpose once?
+        biases = input_buffers[2]
+        activation = options["activation"]
+        stride = options["stride"]
+
+        print("Input shape:", input_data.shape)
+        print("Weights shape:", weights.shape)
+        print("Output shape:", options["out_shape"])
+
+        n = input_data.shape[1] # width (or height, since same)
+        f = weights.shape[1] # fxf filter
+        #padding = options["padding"](n, f, stride)
+        padding = options["padding"]
+        self.options = options
+
+        result = self.eval(input_data, weights, biases, stride, padding,
+                options["out_type"])
+        
+        return activation(result)
+
+class Conv2D(Conv):
     def __repr__(self):
         return "Conv2D"
 
-    def __call__(self, inputs, options):
-        assert len(inputs) == 3, "Conv2D assumes three inputs"
-        input_data = inputs[0]
-        weights = inputs[1]
-        biases = inputs[2]
-        activation = options["activation"]
-        stride = options["stride"]
+    def eval(self, *args, **kwargs):
+        return conv2d_mine(*args, **kwargs)
+        #return conv2d_tf(*args, **kwargs)
+        #if isinstance(self.options["padding"], PaddingSame):
+        #    new_args = list(args)
+        #    new_args[4] = "SAME"
+        #    tfs = conv2d_tf(*new_args, **kwargs)
+        #else:
+        #    new_args = list(args)
+        #    new_args[4] = "VALID"
+        #    tfs = conv2d_tf(*new_args, **kwargs)
 
-        print("Input shape:", input_data.shape)
-        print("Weights shape:", weights.shape)
-        print("Output shape:", options["out_shape"])
+        # TODO remove
+        # FeatureExtractor/MobilenetV1/Conv2d_13_pointwise_1_Conv2d_3_1x1_128/Relu6 very different
+        #if self.options["input_name"] == "FeatureExtractor/MobilenetV1/Conv2d_13_pointwise_1_Conv2d_3_1x1_128/Relu6":
+        print("Mine 2,2")
+        print(mine[:,2,2,:])
+        print("TensorFlow's 2,2")
+        print(tfs[:,2,2,:])
+        
+        # TODO check edge and not near the edge
+        sys.exit(1)
 
-        n = input_data.shape[1] # width (or height, since same)
-        f = weights.shape[1] # fxf filter
-        padding = options["padding"](n, f, stride)
+        return mine
 
-        print("Padding:", padding)
-
-        result = conv2d(input_data, weights, biases, stride, padding,
-                options["out_type"])
-
-        print("Result shape:", result.shape)
-
-        return activation(result)
-
-class DepthwiseConv2D:
+class DepthwiseConv2D(Conv):
     def __repr__(self):
         return "DepthwiseConv2D"
 
-    def __call__(self, inputs, options):
-        assert len(inputs) == 3, "DepthwiseConv2D assumes three inputs"
-        input_data = inputs[0]
-        weights = inputs[1]
-        biases = inputs[2]
-        activation = options["activation"]
-        stride = options["stride"]
-
-        print("Input shape:", input_data.shape)
-        print("Weights shape:", weights.shape)
-        print("Output shape:", options["out_shape"])
-
-        n = input_data.shape[1] # width (or height, since same)
-        f = weights.shape[1] # fxf filter
-        padding = options["padding"](n, f, stride)
-
-        print("Padding:", padding)
-
-        result = depthwise_conv2d(input_data, weights, biases, stride, padding,
-                options["out_type"])
-
-        print("Result shape:", result.shape)
-
-        return activation(result)
+    def eval(self, *args, **kwargs):
+        return depthwise_conv2d_mine(*args, **kwargs)
+        #return depthwise_conv2d_tf(*args, **kwargs)
+        #if isinstance(self.options["padding"], PaddingSame):
+        #    new_args = list(args)
+        #    new_args[4] = "SAME"
+        #    return depthwise_conv2d_tf(*new_args, **kwargs)
+        #else:
+        #    new_args = list(args)
+        #    new_args[4] = "VALID"
+        #    return depthwise_conv2d_tf(*new_args, **kwargs)
 
 class ActivationNone:
     def __repr__(self):
@@ -219,21 +327,36 @@ class ActivationRELU6:
     def __call__(self, inputs):
         return np.minimum(np.maximum(inputs, 0), 6)
 
-class PaddingSame:
-    def __repr__(self):
-        return "PaddingSame"
-
-    def __call__(self, n, f, s):
-        # SAME with s=2 apparently doesn't actually keep it the same size
-        #return (n*(s-1)+f-s)/2
-        return (f-1)/2
-
-class PaddingValid:
-    def __repr__(self):
-        return "PaddingValid"
-
-    def __call__(self, n, f, s):
-        return 0 # No padding
+#class PaddingSame:
+#    def __repr__(self):
+#        return "PaddingSame"
+#
+#    def __call__(self, n, f, s):
+#        """
+#        Official equations given on:
+#        https://www.tensorflow.org/api_guides/python/nn#Notes_on_SAME_Convolution_Padding
+#        https://www.tensorflow.org/api_guides/python/nn#Convolution
+#
+#        However, they error at times. But, the very simple and common (f-1)/2
+#        works apparently. Again, TF docs don't appear to be true?
+#        """
+#        # SAME with s=2 apparently doesn't actually keep it the same size
+#        #return (n*(s-1)+f-s)/2
+#        return (f-1)/2
+#
+#        #if n%s == 0:
+#        #    pad = max(f - s, 0)
+#        #else:
+#        #    pad = max(f - (n%s), 0)
+#
+#        #return pad
+#
+#class PaddingValid:
+#    def __repr__(self):
+#        return "PaddingValid"
+#
+#    def __call__(self, n, f, s):
+#        return 0 # No padding
 
 def get_model(filename):
     """ Get .tflite model from the FlatBuffer file """
@@ -295,9 +418,9 @@ def get_padding(pad):
     padding = None
 
     if pad == tflite.Padding.Padding.SAME:
-        padding = PaddingSame()
+        padding = Padding.SAME
     elif pad == tflite.Padding.Padding.VALID:
-        padding = PaddingValid()
+        padding = Padding.VALID
     else:
         raise NotImplementedError("padding "+str(pad)+" not implemented")
 
@@ -452,16 +575,24 @@ def get_tensors(subgraph):
         shape = tensor.ShapeAsNumpy()
         tensor_type = get_type(tensor.Type())
         tensor_buf_index = tensor.Buffer()
+        quant = tensor.Quantization()
+        quant_scale = quant.ScaleAsNumpy()
+        quant_zero_point = quant.ZeroPointAsNumpy()
         is_variable = tensor.IsVariable()
 
         assert is_variable == False, \
             "Only support is_variable == False at the moment"
+        assert quant_scale == 0 and quant_zero_point == 0, \
+            "Do not support quantization at the moment "+ \
+            "(float probably faster on GPU anyway)"
 
         tensors.append({
             "name": name,
             "shape": shape,
             "type": tensor_type,
             "buffer": tensor_buf_index,
+            #"quant_scale": quant_scale,
+            #"quant_zero": quant_zero_point,
         })
 
     return tensors
@@ -566,7 +697,8 @@ def run_model(model, input_data):
         op = ops[operator["op"]]
         options = operator["options"]
 
-        print("Input", tensors[operator["inputs"][0]]["name"], "running op", op)
+        input_name = tensors[operator["inputs"][0]]["name"]
+        print("Input", input_name, "running op", op)
 
         # TODO Skipping the custom op for now
         if isinstance(op, TFLite_Detection_PostProcess):
@@ -576,13 +708,21 @@ def run_model(model, input_data):
         output_tensor = tensors[operator["outputs"][0]]
         options["out_type"] = output_tensor["type"]
         options["out_shape"] = output_tensor["shape"]
+        options["input_name"] = input_name
 
         # Get input tensors
-        inputs = get_tensor_buffers(bufs,
-            get_tensors_by_index(tensors, operator["inputs"]))
+        input_tensors = get_tensors_by_index(tensors, operator["inputs"])
+
+        for t in input_tensors:
+            # Some are by default just a 0, so make sure it's not when we use it
+            assert not isinstance(bufs[t["buffer"]], int), \
+                "Input buffer "+str(t["buffer"])+" must be defined by time it's used: "+ \
+                str(bufs[t["buffer"]])
+
+        input_buffers = get_tensor_buffers(bufs, input_tensors)
 
         # Run operation
-        output_data = op(inputs, options)
+        output_data = op(input_tensors, input_buffers, options)
 
         assert len(operator["outputs"]) == 1, \
             "Only support single output at the moment"
@@ -602,35 +742,118 @@ def run_model(model, input_data):
     #    buf = t["buffer"]
     #    results.append(buf)
 
-    # Get different output: concat and concat_1
-    concat = None
-    concat_1 = None
+    # Get different output not requiring the custom op
+    prediction_boxes = None
+    prediction_classes = None
 
     for t in tensors:
-        if t["name"] == "concat":
-            concat = bufs[t["buffer"]]
-        elif t["name"] == "concat_1":
-            concat_1 = bufs[t["buffer"]]
+        if t["name"] == "Squeeze":
+            prediction_boxes = bufs[t["buffer"]]
+        elif t["name"] == "convert_scores":
+            prediction_classes = bufs[t["buffer"]]
 
     np.save("tflite_manual.npy", {
         t["name"]: bufs[t["buffer"]] for t in tensors
     })
     print("Total number of tensors:", len(tensors))
 
-    #return results
+    return prediction_boxes, prediction_classes
 
-def load_test_image(test_image_dir, width=300, height=300, index=0):
+def load_test_image(test_image_dir, width=300, height=300,
+        input_mean=127.5, input_std=127.5, index=-1):
     """ Load one test image """
     test_images = [os.path.join(d, f) for d, f in find_files(test_image_dir)]
     img = Image.open(test_images[index])
     img = img.resize((width, height))
     img = load_image_into_numpy_array(img)
+    #img = np.ones(img.shape, dtype=np.float32)*255 # TODO remove
+    img = (np.float32(img) - input_mean) / input_std
     img = np.expand_dims(img, axis=0)
     return img
 
-if __name__ == "__main__":
-    model = get_model("detect_quantized.tflite")
-    display_model(model)
+def tests():
+    """ See if my implementation is consistent with the TensorFlow Lite ones """
+    # Conv2D
+    #
+    # See:
+    # https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/kernels/conv_test.cc
+    data = np.array([
+        1, 1, 1, 1, 2, 2, 2, 2,
+        1, 2, 3, 4, 1, 2, 3, 4,
+    ]).reshape((2, 2, 4, 1)).astype(np.float32)
+    weights = np.array([
+        1, 2, 3, 4,
+        -1, 1, -1, 1,
+        -1, -1, 1, 1
+    ]).reshape((3, 2, 2, 1)).transpose((1,2,3,0)).astype(np.float32)
+    bias = np.array([1, 2, 3]).astype(np.float32)
+    stride = 1
+    result_tf = conv2d_tf(data, weights, bias, stride, Padding.VALID, np.float32)
+    result = conv2d_mine(data, weights, bias, stride, Padding.VALID, np.float32)
+    assert (result == np.array([
+        18, 2, 5, 18, 2, 5, 18, 2, 5,
+        17, 4, 3, 27, 4, 3, 37, 4, 3]).reshape((2, 1, 3, 3))).all(), \
+        "Test 1 gives "+str(result)
 
+    # HandCalculatedWithBiasFloat32
+    w = 4; h = 3; depth = 1; f = 3; filters = 1; stride = 1;
+    data = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).reshape((1, h, w, depth)).astype(np.float32)
+    weights = np.array([1, 4, 7, 2, 5, 8, 3, 6, 9]).reshape((depth, f, f, filters)).transpose((1,2,3,0)).astype(np.float32)
+    bias = np.array([10]).astype(np.float32)
+    result_tf = conv2d_tf(data, weights, bias, stride, Padding.SAME, np.float32)
+    result = conv2d_mine(data, weights, bias, stride, Padding.SAME, np.float32)
+    assert (result == np.array([
+        115, 160, 193, 105, 245, 322,
+        367, 188, 197, 244, 271, 131]).reshape(1, h, w, filters)).all(), \
+        "Test 2 gives "+str(result)
+
+    # HandCalculatedValidFloat32
+    w = 4; h = 3; depth = 1; f = 3; filters = 1; stride = 1;
+    data = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).reshape((1, h, w, depth)).astype(np.float32)
+    weights = np.array([1, 4, 7, 2, 5, 8, 3, 6, 9]).reshape((depth, f, f, filters)).transpose((1,2,3,0)).astype(np.float32)
+    bias = np.array([0]).astype(np.float32)
+    result = conv2d_mine(data, weights, bias, stride, Padding.VALID, np.float32)
+    assert (result == np.array([312, 357]).reshape(1, 1, 2, 1)).all(), \
+        "Test 3 gives "+str(result)
+
+    # HandCalculatedWithBiasFloat32 but with stride of 2
+    w = 4; h = 3; depth = 1; f = 3; filters = 1; stride = 2;
+    data = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).reshape((1, h, w, depth)).astype(np.float32)
+    weights = np.array([1, 4, 7, 2, 5, 8, 3, 6, 9]).reshape((depth, f, f, filters)).transpose((1,2,3,0)).astype(np.float32)
+    bias = np.array([10]).astype(np.float32)
+    result_tf = conv2d_tf(data, weights, bias, stride, Padding.SAME, np.float32)
+    result = conv2d_mine(data, weights, bias, stride, Padding.SAME, np.float32)
+    assert (result == result_tf).all(), "Test 4 gives "+str(result)
+    
+    # Depthwise Conv2D
+    #
+    # SimpleTest
+    data = np.array([
+        1, 2, 7, 8,
+        3, 4, 9, 10,
+        5, 6, 11, 12]).reshape((1, 3, 2, 2)).astype(np.float32)
+    weights = np.array([
+        1, 2, 3, 4,
+        -9, 10, -11, 12,
+        5, 6, 7, 8,
+        13, -14, 15, -16]).reshape((1, 2, 2, 4)).astype(np.float32)
+    bias = np.array([1, 2, 3, 4]).astype(np.float32)
+    stride = 1
+    #pad = 0
+    #print(data)
+    #print(weights)
+    #result = depthwise_conv2d(data, weights, bias, stride, Padding.VALID, np.float32)
+    #print(result)
+    #print(result.shape)
+    #assert (result == np.array([
+    #    115, 160, 193, 105, 245, 322,
+    #    367, 188, 197, 244, 271, 131]).reshape(1, h, w, filters)).all(), "Test 5"
+
+if __name__ == "__main__":
+    tests()
+
+    model = get_model("detect_float.tflite")
+    #display_model(model)
     img = load_test_image("test_images")
     run_model(model, img)
+
