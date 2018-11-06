@@ -19,6 +19,12 @@ https://github.com/freedomtan/tensorflow/blob/deeplab_tflite_python/tensorflow/c
 
 Used to plot results from concat and concat_1 outputs of the official TF Lite
 implementation and my own to compare.
+
+Loads one of two files:
+    - official implementation: ./object_detection.py --offline --debug --model tflite_float.py
+        - outputs tflite_official.npy
+    - numpy implementation:    ./tflite_numpy.py
+        - outputs tflite_manual.npy
 """
 from __future__ import absolute_import
 from __future__ import division

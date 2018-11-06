@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
 Run TF Lite model using numpy rather than the TensorFlow TF Lite implementation
+
+The goal: code a version so I know for fact that I can load and parse flatbuffer
+and then use the weights, biases, etc. to generate the desired bounding boxes
+and class information on input images.
+
+Next step: implement this on the GPU.
+
+How to use this "reference implementation" (a.k.a. a hacky script):
+ - Running this will output tflite_manual.npy
+ - Then run tflite_numpy_visualize.py to check the results on the last image in
+   test_images (index == -1 at the moment)
 """
 import os
 import sys
@@ -57,6 +68,9 @@ class Logistic:
         return (1 / (1 + np.exp(-input_buffers[0]))).astype(options["out_type"])
 
 class TFLite_Detection_PostProcess:
+    """ Refer to:
+    https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/kernels/detection_postprocess.cc
+    """
     def __repr__(self):
         return "TFLite_Detection_PostProcess"
 
@@ -65,12 +79,7 @@ class TFLite_Detection_PostProcess:
 
 def zero_pad(x, pad_before_h, pad_after_h, pad_before_w, pad_after_w):
     """
-    Input: x (batch_size, n_H, n_W, n_C), padding amount
-    Output: (m, n_H + 2*pad, n_W + 2*pad, n_C)
-
-    Apparently "SAME" padding in TF does *not* add padding to the top left at
-    all!? That is not what the TF docs say. They say round down top/left and
-    round up bottom/right.
+    Input: x (batch_size, n_H, n_W, n_C), padding amount before/after
     """
     # Not an integer, must have different padding on either side
     #if int(pad) != pad:
@@ -101,6 +110,10 @@ def calc_padding(input_size, filter_size, stride, pad_type):
     """
     See:
     https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/common_shape_fns.cc#L20
+
+    Official equations given on:
+    https://www.tensorflow.org/api_guides/python/nn#Notes_on_SAME_Convolution_Padding
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
     """
     if pad_type == Padding.VALID:
         output_size = int((input_size - filter_size + stride) / stride)
@@ -128,6 +141,10 @@ def conv2d_mine(x, W, b, stride, pad, out_type):
     Input: x (m, n_H_prev, n_W_prev, n_C_prev), W (f, f, n_C_prev, n_C), b (1, 1, 1, n_C)
     Output: (m, n_H, n_W, n_C)
     https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/conv_ops.cc#L416
+    https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/kernels/conv.cc#L262
+
+    For faster implementation, maybe see:
+    https://wiseodd.github.io/techblog/2016/07/16/convnet-conv-layer/
     """
     (m, n_H_prev, n_W_prev, n_C_prev) = x.shape
     (f, f, n_C_prev, n_C) = W.shape
@@ -275,27 +292,6 @@ class Conv2D(Conv):
     def eval(self, *args, **kwargs):
         return conv2d_mine(*args, **kwargs)
         #return conv2d_tf(*args, **kwargs)
-        #if isinstance(self.options["padding"], PaddingSame):
-        #    new_args = list(args)
-        #    new_args[4] = "SAME"
-        #    tfs = conv2d_tf(*new_args, **kwargs)
-        #else:
-        #    new_args = list(args)
-        #    new_args[4] = "VALID"
-        #    tfs = conv2d_tf(*new_args, **kwargs)
-
-        # TODO remove
-        # FeatureExtractor/MobilenetV1/Conv2d_13_pointwise_1_Conv2d_3_1x1_128/Relu6 very different
-        #if self.options["input_name"] == "FeatureExtractor/MobilenetV1/Conv2d_13_pointwise_1_Conv2d_3_1x1_128/Relu6":
-        print("Mine 2,2")
-        print(mine[:,2,2,:])
-        print("TensorFlow's 2,2")
-        print(tfs[:,2,2,:])
-        
-        # TODO check edge and not near the edge
-        sys.exit(1)
-
-        return mine
 
 class DepthwiseConv2D(Conv):
     def __repr__(self):
@@ -304,14 +300,6 @@ class DepthwiseConv2D(Conv):
     def eval(self, *args, **kwargs):
         return depthwise_conv2d_mine(*args, **kwargs)
         #return depthwise_conv2d_tf(*args, **kwargs)
-        #if isinstance(self.options["padding"], PaddingSame):
-        #    new_args = list(args)
-        #    new_args[4] = "SAME"
-        #    return depthwise_conv2d_tf(*new_args, **kwargs)
-        #else:
-        #    new_args = list(args)
-        #    new_args[4] = "VALID"
-        #    return depthwise_conv2d_tf(*new_args, **kwargs)
 
 class ActivationNone:
     def __repr__(self):
@@ -326,37 +314,6 @@ class ActivationRELU6:
 
     def __call__(self, inputs):
         return np.minimum(np.maximum(inputs, 0), 6)
-
-#class PaddingSame:
-#    def __repr__(self):
-#        return "PaddingSame"
-#
-#    def __call__(self, n, f, s):
-#        """
-#        Official equations given on:
-#        https://www.tensorflow.org/api_guides/python/nn#Notes_on_SAME_Convolution_Padding
-#        https://www.tensorflow.org/api_guides/python/nn#Convolution
-#
-#        However, they error at times. But, the very simple and common (f-1)/2
-#        works apparently. Again, TF docs don't appear to be true?
-#        """
-#        # SAME with s=2 apparently doesn't actually keep it the same size
-#        #return (n*(s-1)+f-s)/2
-#        return (f-1)/2
-#
-#        #if n%s == 0:
-#        #    pad = max(f - s, 0)
-#        #else:
-#        #    pad = max(f - (n%s), 0)
-#
-#        #return pad
-#
-#class PaddingValid:
-#    def __repr__(self):
-#        return "PaddingValid"
-#
-#    def __call__(self, n, f, s):
-#        return 0 # No padding
 
 def get_model(filename):
     """ Get .tflite model from the FlatBuffer file """
@@ -766,7 +723,6 @@ def load_test_image(test_image_dir, width=300, height=300,
     img = Image.open(test_images[index])
     img = img.resize((width, height))
     img = load_image_into_numpy_array(img)
-    #img = np.ones(img.shape, dtype=np.float32)*255 # TODO remove
     img = (np.float32(img) - input_mean) / input_std
     img = np.expand_dims(img, axis=0)
     return img
@@ -827,6 +783,7 @@ def tests():
     
     # Depthwise Conv2D
     #
+    # https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/kernels/depthwise_conv_test.cc
     # SimpleTest
     data = np.array([
         1, 2, 7, 8,
@@ -839,6 +796,7 @@ def tests():
         13, -14, 15, -16]).reshape((1, 2, 2, 4)).astype(np.float32)
     bias = np.array([1, 2, 3, 4]).astype(np.float32)
     stride = 1
+    # TODO
     #pad = 0
     #print(data)
     #print(weights)
@@ -853,7 +811,7 @@ if __name__ == "__main__":
     tests()
 
     model = get_model("detect_float.tflite")
-    #display_model(model)
+    display_model(model)
+
     img = load_test_image("test_images")
     run_model(model, img)
-

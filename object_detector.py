@@ -251,6 +251,10 @@ class TFLiteObjectDetector:
         num_detections = self.interpreter.get_tensor(self.output_details[3]['index'])
 
         if output_numpy_concat:
+            # For use in comparing with tflite_numpy.py
+            #
+            # For internals of Interpreter, see:
+            # https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/python/interpreter.py
             np.save("tflite_official.npy", {
                 self.interpreter._get_tensor_details(i)["name"]: self.interpreter.get_tensor(i) for i in range(176)
                 #self.interpreter._get_tensor_details(i)["name"]: np.copy(self.interpreter.tensor(i)()) for i in range(176)
