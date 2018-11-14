@@ -2,4 +2,4 @@
 #
 # Sync files to RPi Zero
 #
-rsync -Pahuv ./ rpiz:vision-landing/
+rsync -Pahuv --exclude="record" ./ rpiz:vision-landing/
