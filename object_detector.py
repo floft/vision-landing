@@ -310,8 +310,13 @@ class ObjectDetectorBase:
         else:
             self.detector = TFObjectDetector(model_file, labels_path, min_score)
 
-        self.fps = deque(maxlen=average_fps_frames) # compute average FPS over # of frames
-        self.fps_start_time = 0
+        # compute average FPS over # of frames
+        self.fps = deque(maxlen=average_fps_frames)
+
+        # compute streaming FPS (how fast frames are arriving from camera
+        # and we're able to process them, i.e. this is the actual FPS)
+        self.stream_fps = deque(maxlen=average_fps_frames)
+        self.process_end_last = 0
 
     def open(self):
         if not self.lite:
@@ -332,6 +337,10 @@ class ObjectDetectorBase:
         """ Return average FPS over last so many frames (specified in constructor) """
         return sum(list(self.fps))/len(self.fps)
 
+    def avg_stream_fps(self):
+        """ Return average streaming FPS over last so many frames (specified in constructor) """
+        return sum(list(self.stream_fps))/len(self.stream_fps)
+
     def process(self, *args, **kwargs):
         if self.debug:
             # Start timer
@@ -340,12 +349,20 @@ class ObjectDetectorBase:
         detections = self.detector.process(*args, **kwargs)
 
         if self.debug:
+            now = time.time()
+
             # End timer
-            fps = 1/(time.time() - fps)
+            fps = 1/(now - fps)
             self.fps.append(fps)
 
-            print("Object Detection FPS", "{:<5}".format("%.2f"%fps), \
-                    "Average", "{:<5}".format("%.2f"%self.avg_fps()))
+            # Streaming FPS
+            stream_fps = 1/(now - self.process_end_last)
+            self.stream_fps.append(stream_fps)
+            self.process_end_last = now
+
+            print("Object Detection",
+                "Process FPS", "{:<5}".format("%.2f"%self.avg_fps()),
+                "Stream FPS", "{:<5}".format("%.2f"%self.avg_stream_fps()))
 
         return detections
 
