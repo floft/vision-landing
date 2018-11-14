@@ -12,8 +12,10 @@ And for some TF Lite stuff:
 https://github.com/freedomtan/tensorflow/blob/deeplab_tflite_python/tensorflow/contrib/lite/examples/python/object_detection.py
 """
 import os
+import re
 import time
 import zmq
+import pathlib
 import argparse
 import numpy as np
 import tensorflow as tf
@@ -31,6 +33,31 @@ try:
     from picamera.array import PiRGBArray
 except ImportError:
     print("Warning: cannot import picamera, live mode won't work")
+
+def latest_index(dir_name, glob="*"):
+    """
+    Looks in dir_name at all files matching glob and returns highest number
+
+    For folders: glob="*"
+    For files: glob="*.jpg"
+    """
+    # Get list of files/folders
+    files = pathlib.Path(dir_name).glob(glob)
+
+    # Get number from filenames or folders
+    regex = re.compile(r'\d+')
+    numbers = []
+
+    for f in files:
+        f_numbers = [int(x) for x in regex.findall(str(f.name))]
+        assert len(f_numbers) == 1, "Should only be 1 number in file/folder"
+        numbers.append(f_numbers[0])
+
+    # If there is a highest number, get it. Otherwise, start at zero.
+    if len(numbers) > 0:
+        return sorted(numbers)[-1] # Highest number
+    else:
+        return 0
 
 def load_labels(filename):
     """
@@ -69,7 +96,7 @@ def detection_results(boxes, classes, scores, img_width, img_height,
 
     return detections
 
-def detection_show(image_np, detections, debug=True, show_image=True, debug_image_size=(12,8)):
+def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8)):
     """ For debugging, show the image with the bounding boxes """
     if len(detections) == 0:
         return
@@ -79,9 +106,6 @@ def detection_show(image_np, detections, debug=True, show_image=True, debug_imag
         fig, ax = plt.subplots(1, figsize=debug_image_size, num=1)
 
     for r in detections:
-        if debug:
-            print(r)
-
         if show_image:
             topleft = (r["xmin"], r["ymin"])
             width = r["xmax"] - r["xmin"]
@@ -326,14 +350,22 @@ class ObjectDetectorBase:
         return detections
 
     def run(self):
-        raise NotImplemented("Must implement run() function")
+        raise NotImplementedError("Must implement run() function")
 
 class RemoteObjectDetector(ObjectDetectorBase):
     """ Run object detection on images streamed from a remote camera """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def run(self, host, port, show_image=False):
+    def run(self, host, port, show_image=False, record=""):
+        # Don't overwrite previous images if there are any
+        if record != "":
+            if not os.path.exists(record):
+                os.makedirs(record)
+                img_index = 1
+            else:
+                img_index = latest_index(record, "*.jpg")+1
+
         while True:
             try:
                 context = zmq.Context()
@@ -348,11 +380,17 @@ class RemoteObjectDetector(ObjectDetectorBase):
                     frame = socket.recv_pyobj()
                     detections = self.process(frame, frame.shape[1], frame.shape[0])
 
+                    if record != "":
+                        filename = os.path.join(record, "%05d.jpg"%img_index)
+                        Image.fromarray(frame).save(filename)
+                        img_index += 1
+                        print("Saved", filename)
+
                     if self.debug:
                         for i, d in enumerate(detections):
                             print("Result "+str(i)+":", d)
 
-                    detection_show(frame, detections, self.debug, show_image)
+                    detection_show(frame, detections, show_image)
 
                 time.sleep(0.5)
             except KeyboardInterrupt:
@@ -397,13 +435,14 @@ class OfflineObjectDetector(ObjectDetectorBase):
             orig_img = load_image_into_numpy_array(orig_img)
             resize_img = load_image_into_numpy_array(resize_img)
 
-            # TODO remove
-            #resize_img = np.ones(resize_img.shape, dtype=np.float32)*255
-
             detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0],
                     output_numpy_concat=(self.debug and i == len(test_images)-1))
 
-            detection_show(orig_img, detections, self.debug, show_image)
+            if self.debug:
+                for i, d in enumerate(detections):
+                    print("Result "+str(i)+":", d)
+
+            detection_show(orig_img, detections, show_image)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -444,6 +483,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-lite", dest='lite', action='store_false',
         help="Do not use TF Lite")
 
+    parser.add_argument("--record", default="", type=str,
+        help="Record the received remote frames in a specified directory (default disabled)")
+
     parser.add_argument("--debug", dest='debug', action='store_true',
         help="Output debug information (fps and detection results) (default) ")
     parser.add_argument("--no-debug", dest='debug', action='store_false',
@@ -457,10 +499,27 @@ if __name__ == "__main__":
     assert args.remote + args.live + args.offline == 1, \
         "Must specify exactly one of --remote, --live, or --offline"
 
+    # Directory for recording, e.g. if "record" and there are directories
+    # record/00000 and record/00001, then we'll start next at record record/00002
+    record_dir = ""
+
+    if args.record != "":
+        # Find previous index
+        record_index = latest_index(args.record, "*")
+        # If no images in that directory, use it. If images, increment
+        record_dir_prev = os.path.join(args.record, "%05d"%record_index)
+        img_index = latest_index(record_dir_prev, "*.jpg")
+
+        if img_index == 0:
+            record_dir = record_dir_prev
+        else:
+            record_index += 1
+            record_dir = os.path.join(args.record, "%05d"%record_index)
+
     # Run detection
     if args.remote:
         with RemoteObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
-            d.run(args.host, args.port, show_image=args.show)
+            d.run(args.host, args.port, show_image=args.show, record=record_dir)
     elif args.live:
         with LiveObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
             d.run(640, 480, 15)
