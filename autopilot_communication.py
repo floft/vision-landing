@@ -44,14 +44,16 @@ class AutopilotCommuncation:
         self.master.mav.request_data_stream_send(
                 self.master.target_system,
                 self.master.target_component,
-                mavutil.mavlink.MAV_DATA_STREAM_ALL, self.rate, 1)
+                mavutil.mavlink.MAV_DATA_STREAM_RC_CHANNELS, self.rate, 1)
+        # For everything: MAV_DATA_STREAM_ALL
+        # See https://github.com/PX4/Firmware/blob/master/Tools/mavlink_px4.py#L338
 
         while not self.exiting:
             msg = self.master.recv_match(blocking=True)
             msg_type = msg.get_type()
             msg_data = msg.to_dict()
 
-            if msg_type == "RC_CHANNELS":
+            if msg_type == "RC_CHANNELS_RAW":
                 val = msg_data["chan"+str(self.channel)+"_raw"]
 
                 if val < self.cutoffs[0]:

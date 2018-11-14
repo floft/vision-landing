@@ -1,0 +1,13 @@
+[Unit]
+Description=Stream Video
+
+[Service]
+ExecStart=/home/pi/vision-landing/stream.py
+Restart=always
+RestartSec=5
+User=pi
+Group=users
+SupplementaryGroups=dialout video
+
+[Install]
+WantedBy=multi-user.target

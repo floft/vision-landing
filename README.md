@@ -61,3 +61,10 @@ On laptop:
 Then map a switch on your R/C controller to channel 6. For low PPM value it'll
 do nothing, for higher it'll stream, and for even higher it'll shut down the
 Raspberry Pi (for exact values, see script).
+
+Or, if you wish to always run on boot (running */home/pi/vision-landing/stream.py*
+as user *pi* and group *dialout* for access to */dev/ttyAMA0*):
+
+    sudo cp stream.service /etc/systemd/system/
+    sudo systemctl enable stream
+    sudo systemctl start stream
