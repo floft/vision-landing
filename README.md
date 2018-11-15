@@ -53,10 +53,12 @@ On Pi:
     cd ./vision-landing
     ./stream.py
 
-On laptop (and outputting debug info and saving images to record/):
+On laptop (and outputting debug info, saving images to record/, displaying with
+GStreamer):
 
+    sudo pacman -S gst-python
     cd ./vision-landing
-    ./object_detection.py --remote --host rpi-zero --debug --record=record
+    ./object_detection.py --remote --host rpi-zero --debug --record=record --gst
 
 Then map a switch on your R/C controller to channel 6. For low PPM value it'll
 do nothing, for higher it'll stream, and for even higher it'll shut down the

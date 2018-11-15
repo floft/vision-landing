@@ -17,6 +17,7 @@ import time
 import zmq
 import pathlib
 import argparse
+import threading
 import numpy as np
 import tensorflow as tf
 from collections import deque
@@ -25,6 +26,13 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from tensorflow.contrib.lite.python import interpreter as interpreter_wrapper
+
+# Gstreamer
+import gi
+gi.require_version('Gst', '1.0')
+gi.require_version('GLib', '2.0')
+gi.require_version('GObject', '2.0')
+from gi.repository import GLib, GObject, Gst
 
 from image import find_files, load_image_into_numpy_array
 
@@ -371,8 +379,68 @@ class ObjectDetectorBase:
 
 class RemoteObjectDetector(ObjectDetectorBase):
     """ Run object detection on images streamed from a remote camera """
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, gst=False, gst_width=300, gst_height=300, **kwargs):
+        self.gst = gst
+        self.exiting = False
         super().__init__(*args, **kwargs)
+
+        # Run GStreamer in separate thread
+        if self.gst:
+            self.t_gst = threading.Thread(target=self.gst_run)
+            self.gst_frame = np.zeros((gst_width, gst_height, 3))
+
+            Gst.init(None)
+
+            self.pipe = Gst.Pipeline.new("live-stream")
+            self.src = Gst.ElementFactory.make("appsrc")
+            convert = Gst.ElementFactory.make("videoconvert")
+            sink = Gst.ElementFactory.make("autovideosink")
+
+            caps = Gst.Caps.from_string("video/x-raw,"
+                +"format=(string)RGB,"
+                +"width="+str(gst_width)+","
+                +"height="+str(gst_height)+","
+                +"framerate=15/1")
+            self.src.set_property("caps", caps)
+            self.src.set_property("format", Gst.Format.TIME)
+
+            self.pipe.add(self.src, convert, sink)
+            self.src.link(convert)
+            convert.link(sink)
+
+            # create and event loop and feed gstreamer bus mesages to it
+            self.loop = GLib.MainLoop()
+
+            bus = self.pipe.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self.gst_bus_call, self.loop)
+
+    def gst_bus_call(self, bus, message, loop):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("End-of-stream")
+            loop.quit()
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print("Error: %s: %s" % (err, debug))
+            loop.quit()
+        return True
+
+    def gst_next_frame(self, frame):
+        #data = np.ascontiguousarray(frame, dtype=np.uint8)
+        data = frame.tobytes()
+        buf = Gst.Buffer.new_wrapped(data)
+        self.src.emit("push-buffer", buf)
+
+    def gst_run(self):
+        self.pipe.set_state(Gst.State.PLAYING)
+
+        try:
+            self.loop.run()
+        except:
+            pass
+
+        self.pipe.set_state(Gst.State.NULL)
 
     def run(self, host, port, show_image=False, record=""):
         # Don't overwrite previous images if there are any
@@ -383,7 +451,10 @@ class RemoteObjectDetector(ObjectDetectorBase):
             else:
                 img_index = latest_index(record, "*.jpg")+1
 
-        while True:
+        if self.gst:
+            self.t_gst.start()
+
+        while not self.exiting:
             try:
                 context = zmq.Context()
                 socket = context.socket(zmq.SUB)
@@ -395,6 +466,10 @@ class RemoteObjectDetector(ObjectDetectorBase):
 
                 while socket:
                     frame = socket.recv_pyobj()
+
+                    if self.gst:
+                        self.gst_next_frame(frame)
+
                     detections = self.process(frame, frame.shape[1], frame.shape[0])
 
                     if record != "":
@@ -411,7 +486,11 @@ class RemoteObjectDetector(ObjectDetectorBase):
 
                 time.sleep(0.5)
             except KeyboardInterrupt:
-                break
+                self.exiting = True
+
+                if self.gst:
+                    self.loop.quit()
+                    self.t_gst.join()
 
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
@@ -495,6 +574,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-show", dest='show', action='store_false',
         help="Do not show image with detection results (default)")
 
+    parser.add_argument("--gst", dest='gst', action='store_true',
+        help="Show streamed images with GStreamer")
+    parser.add_argument("--no-gst", dest='gst', action='store_false',
+        help="Do not show streamed images with GStreamer (default)")
+
     parser.add_argument("--lite", dest='lite', action='store_true',
         help="Use TF Lite (default)")
     parser.add_argument("--no-lite", dest='lite', action='store_false',
@@ -535,11 +619,14 @@ if __name__ == "__main__":
 
     # Run detection
     if args.remote:
-        with RemoteObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
+        with RemoteObjectDetector(args.model, args.labels,
+                debug=args.debug, lite=args.lite, gst=args.gst) as d:
             d.run(args.host, args.port, show_image=args.show, record=record_dir)
     elif args.live:
-        with LiveObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
+        with LiveObjectDetector(args.model, args.labels,
+                debug=args.debug, lite=args.lite) as d:
             d.run(640, 480, 15)
     elif args.offline:
-        with OfflineObjectDetector(args.model, args.labels, debug=args.debug, lite=args.lite) as d:
+        with OfflineObjectDetector(args.model, args.labels,
+                debug=args.debug, lite=args.lite) as d:
             d.run(args.images, show_image=args.show)
