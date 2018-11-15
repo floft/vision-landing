@@ -37,7 +37,7 @@ Raspberry Pi.
 
     ssh rpiz
     cd ./vision-landing
-    ./object_detection.py --live
+    ./object_detector.py --live
 
 # Running Object Detection on another computer
 Since the Zero is really slow, I'll stream to another computer to do processing
@@ -58,7 +58,7 @@ GStreamer):
 
     sudo pacman -S gst-python
     cd ./vision-landing
-    ./object_detection.py --remote --host rpi-zero --debug --record=record --gst
+    ./object_detector.py --remote --host rpi-zero --debug --record=record --gst
 
 Then map a switch on your R/C controller to channel 6. For low PPM value it'll
 do nothing, for higher it'll stream, and for even higher it'll shut down the
