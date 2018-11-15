@@ -378,7 +378,10 @@ class ObjectDetectorBase:
         raise NotImplementedError("Must implement run() function")
 
 class RemoteObjectDetector(ObjectDetectorBase):
-    """ Run object detection on images streamed from a remote camera """
+    """
+    Run object detection on images streamed from a remote camera,
+    also supports displaying live stream via GStreamer
+    """
     def __init__(self, *args, gst=False, gst_width=300, gst_height=300, **kwargs):
         self.gst = gst
         self.exiting = False
@@ -387,15 +390,18 @@ class RemoteObjectDetector(ObjectDetectorBase):
         # Run GStreamer in separate thread
         if self.gst:
             self.t_gst = threading.Thread(target=self.gst_run)
-            self.gst_frame = np.zeros((gst_width, gst_height, 3))
 
             Gst.init(None)
 
+            # appsrc -> videoconvert (since data is RGB) -> autovideosink
             self.pipe = Gst.Pipeline.new("live-stream")
             self.src = Gst.ElementFactory.make("appsrc")
             convert = Gst.ElementFactory.make("videoconvert")
             sink = Gst.ElementFactory.make("autovideosink")
 
+            # For now we'll just assume it's a fixed size and a fixed framerate,
+            # though it'll probably be less than this frame rate. It'll just
+            # keep showing the old image till a new one arrives.
             caps = Gst.Caps.from_string("video/x-raw,"
                 +"format=(string)RGB,"
                 +"width="+str(gst_width)+","
@@ -408,14 +414,16 @@ class RemoteObjectDetector(ObjectDetectorBase):
             self.src.link(convert)
             convert.link(sink)
 
-            # create and event loop and feed gstreamer bus mesages to it
+            # Event loop
             self.loop = GLib.MainLoop()
 
+            # Get error messages or end of stream on bus
             bus = self.pipe.get_bus()
             bus.add_signal_watch()
             bus.connect("message", self.gst_bus_call, self.loop)
 
     def gst_bus_call(self, bus, message, loop):
+        """ Print important messages """
         t = message.type
         if t == Gst.MessageType.EOS:
             print("End-of-stream")
@@ -427,12 +435,13 @@ class RemoteObjectDetector(ObjectDetectorBase):
         return True
 
     def gst_next_frame(self, frame):
-        #data = np.ascontiguousarray(frame, dtype=np.uint8)
+        """ When we have a new numpy array RGB image, push it to GStreamer """
         data = frame.tobytes()
         buf = Gst.Buffer.new_wrapped(data)
         self.src.emit("push-buffer", buf)
 
     def gst_run(self):
+        """ This is run in a separate thread. Start, loop, and cleanup. """
         self.pipe.set_state(Gst.State.PLAYING)
 
         try:
@@ -451,6 +460,7 @@ class RemoteObjectDetector(ObjectDetectorBase):
             else:
                 img_index = latest_index(record, "*.jpg")+1
 
+        # If we want GStreamer, start that thread
         if self.gst:
             self.t_gst.start()
 
@@ -467,6 +477,7 @@ class RemoteObjectDetector(ObjectDetectorBase):
                 while socket:
                     frame = socket.recv_pyobj()
 
+                    # We have a new image, so push it to GStreamer
                     if self.gst:
                         self.gst_next_frame(frame)
 
@@ -488,6 +499,7 @@ class RemoteObjectDetector(ObjectDetectorBase):
             except KeyboardInterrupt:
                 self.exiting = True
 
+                # If using GStreamer, tell it to exit and wait
                 if self.gst:
                     self.loop.quit()
                     self.t_gst.join()
