@@ -323,9 +323,12 @@ class TFLiteObjectDetector:
 class ObjectDetectorBase:
     """ Wrap detector to calculate FPS """
     def __init__(self, model_file, labels_path, min_score=0.5,
-            average_fps_frames=30, debug=False, lite=True):
+            average_fps_frames=30, debug=False, lite=True,
+            gst=False, gst_width=300, gst_height=300, gst_framerate=15):
         self.debug = debug
         self.lite = lite
+        self.gst = gst
+        self.exiting = False
 
         if lite:
             self.detector = TFLiteObjectDetector(model_file, labels_path, min_score)
@@ -339,6 +342,41 @@ class ObjectDetectorBase:
         # and we're able to process them, i.e. this is the actual FPS)
         self.stream_fps = deque(maxlen=average_fps_frames)
         self.process_end_last = 0
+
+        # Run GStreamer in separate thread
+        if self.gst:
+            self.t_gst = threading.Thread(target=self.gst_run)
+
+            Gst.init(None)
+
+            # appsrc -> videoconvert (since data is RGB) -> autovideosink
+            self.pipe = Gst.Pipeline.new("object-detection")
+            self.src = Gst.ElementFactory.make("appsrc")
+            convert = Gst.ElementFactory.make("videoconvert")
+            sink = Gst.ElementFactory.make("autovideosink")
+
+            # For now we'll just assume it's a fixed size and a fixed framerate,
+            # though it'll probably be less than this frame rate. It'll just
+            # keep showing the old image till a new one arrives.
+            caps = Gst.Caps.from_string("video/x-raw,"
+                +"format=(string)RGB,"
+                +"width="+str(gst_width)+","
+                +"height="+str(gst_height)+","
+                +"framerate="+str(gst_framerate)+"/1")
+            self.src.set_property("caps", caps)
+            self.src.set_property("format", Gst.Format.TIME)
+
+            self.pipe.add(self.src, convert, sink)
+            self.src.link(convert)
+            convert.link(sink)
+
+            # Event loop
+            self.loop = GLib.MainLoop()
+
+            # Get error messages or end of stream on bus
+            bus = self.pipe.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self.gst_bus_call, self.loop)
 
     def open(self):
         if not self.lite:
@@ -391,51 +429,6 @@ class ObjectDetectorBase:
     def run(self):
         raise NotImplementedError("Must implement run() function")
 
-class RemoteObjectDetector(ObjectDetectorBase):
-    """
-    Run object detection on images streamed from a remote camera,
-    also supports displaying live stream via GStreamer
-    """
-    def __init__(self, *args, gst=False, gst_width=300, gst_height=300, **kwargs):
-        self.gst = gst
-        self.exiting = False
-        super().__init__(*args, **kwargs)
-
-        # Run GStreamer in separate thread
-        if self.gst:
-            self.t_gst = threading.Thread(target=self.gst_run)
-
-            Gst.init(None)
-
-            # appsrc -> videoconvert (since data is RGB) -> autovideosink
-            self.pipe = Gst.Pipeline.new("live-stream")
-            self.src = Gst.ElementFactory.make("appsrc")
-            convert = Gst.ElementFactory.make("videoconvert")
-            sink = Gst.ElementFactory.make("autovideosink")
-
-            # For now we'll just assume it's a fixed size and a fixed framerate,
-            # though it'll probably be less than this frame rate. It'll just
-            # keep showing the old image till a new one arrives.
-            caps = Gst.Caps.from_string("video/x-raw,"
-                +"format=(string)RGB,"
-                +"width="+str(gst_width)+","
-                +"height="+str(gst_height)+","
-                +"framerate=15/1")
-            self.src.set_property("caps", caps)
-            self.src.set_property("format", Gst.Format.TIME)
-
-            self.pipe.add(self.src, convert, sink)
-            self.src.link(convert)
-            convert.link(sink)
-
-            # Event loop
-            self.loop = GLib.MainLoop()
-
-            # Get error messages or end of stream on bus
-            bus = self.pipe.get_bus()
-            bus.add_signal_watch()
-            bus.connect("message", self.gst_bus_call, self.loop)
-
     def gst_bus_call(self, bus, message, loop):
         """ Print important messages """
         t = message.type
@@ -465,6 +458,31 @@ class RemoteObjectDetector(ObjectDetectorBase):
 
         self.pipe.set_state(Gst.State.NULL)
 
+    def gst_start(self):
+        """ If using GStreamer, start that thread """
+        if self.gst:
+            self.t_gst.start()
+
+    def gst_next_detection(self, frame, detections):
+        """ Push new image to GStreamer """
+        if self.gst:
+            low_level_detection_show(frame, detections)
+            self.gst_next_frame(frame)
+
+    def gst_stop(self):
+        """ If using GStreamer, tell it to exit and then wait """
+        if self.gst:
+            self.loop.quit()
+            self.t_gst.join()
+
+class RemoteObjectDetector(ObjectDetectorBase):
+    """
+    Run object detection on images streamed from a remote camera,
+    also supports displaying live stream via GStreamer
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
     def run(self, host, port, show_image=False, record=""):
         # Don't overwrite previous images if there are any
         if record != "":
@@ -474,9 +492,7 @@ class RemoteObjectDetector(ObjectDetectorBase):
             else:
                 img_index = latest_index(record, "*.jpg")+1
 
-        # If we want GStreamer, start that thread
-        if self.gst:
-            self.t_gst.start()
+        self.gst_start()
 
         while not self.exiting:
             try:
@@ -505,22 +521,14 @@ class RemoteObjectDetector(ObjectDetectorBase):
 
                     detection_show(frame, detections, show_image)
 
-                    # We have a new image, so push it to GStreamer
-                    #
                     # We do this last since low_level_detection_show modifies
                     # the image
-                    if self.gst:
-                        low_level_detection_show(frame, detections)
-                        self.gst_next_frame(frame)
+                    self.gst_next_detection(frame, detections)
 
                 time.sleep(0.5)
             except KeyboardInterrupt:
                 self.exiting = True
-
-                # If using GStreamer, tell it to exit and wait
-                if self.gst:
-                    self.loop.quit()
-                    self.t_gst.join()
+                self.gst_stop()
 
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
