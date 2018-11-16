@@ -2,7 +2,7 @@
 Description=Stream Video
 
 [Service]
-ExecStart=/home/pi/vision-landing/stream.py
+ExecStart=/usr/bin/python3 -u /home/pi/vision-landing/stream.py
 Restart=always
 RestartSec=5
 User=pi
