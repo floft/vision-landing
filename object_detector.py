@@ -42,12 +42,12 @@ try:
 except ImportError:
     print("Warning: cannot import picamera, live mode won't work")
 
-def latest_index(dir_name, glob="*"):
+def latest_index(dir_name, glob="*", folders=False):
     """
-    Looks in dir_name at all files matching glob and returns highest number
+    Looks in dir_name at all files matching glob and returns highest number.
 
-    For folders: glob="*"
-    For files: glob="*.jpg"
+    For folders (folders=True): you can leave glob="*"
+    For files (folders=False): probably should specify something like glob="*.jpg"
     """
     # Get list of files/folders
     files = pathlib.Path(dir_name).glob(glob)
@@ -57,9 +57,10 @@ def latest_index(dir_name, glob="*"):
     numbers = []
 
     for f in files:
-        f_numbers = [int(x) for x in regex.findall(str(f.name))]
-        assert len(f_numbers) == 1, "Should only be 1 number in file/folder"
-        numbers.append(f_numbers[0])
+        if not folders or os.path.isdir(f):
+            f_numbers = [int(x) for x in regex.findall(str(f.name))]
+            assert len(f_numbers) == 1, "Should only be 1 number in file/folder"
+            numbers.append(f_numbers[0])
 
     # If there is a highest number, get it. Otherwise, start at zero.
     if len(numbers) > 0:
@@ -131,6 +132,19 @@ def detection_show(image_np, detections, show_image=True, debug_image_size=(12,8
         ax.imshow(image_np)
         fig.canvas.flush_events()
         #plt.pause(0.05)
+
+def low_level_detection_show(image_np, detections, color=[255,0,0], amt=1):
+    """ Overwrite portions on input image with red to display via GStreamer rather than
+    with matplotlib which is slow """
+    for r in detections:
+        # left edge
+        image_np[r["ymin"]-amt:r["ymax"]+amt, r["xmin"]-amt:r["xmin"]+amt, :] = color
+        # right edge
+        image_np[r["ymin"]-amt:r["ymax"]+amt, r["xmax"]-amt:r["xmax"]+amt, :] = color
+        # top edge
+        image_np[r["ymin"]-amt:r["ymin"]+amt, r["xmin"]-amt:r["xmax"]+amt, :] = color
+        # bottom edge
+        image_np[r["ymax"]-amt:r["ymax"]+amt, r["xmin"]-amt:r["xmax"]+amt, :] = color
 
 class TFObjectDetector:
     """
@@ -477,10 +491,6 @@ class RemoteObjectDetector(ObjectDetectorBase):
                 while socket:
                     frame = socket.recv_pyobj()
 
-                    # We have a new image, so push it to GStreamer
-                    if self.gst:
-                        self.gst_next_frame(frame)
-
                     detections = self.process(frame, frame.shape[1], frame.shape[0])
 
                     if record != "":
@@ -494,6 +504,14 @@ class RemoteObjectDetector(ObjectDetectorBase):
                             print("Result "+str(i)+":", d)
 
                     detection_show(frame, detections, show_image)
+
+                    # We have a new image, so push it to GStreamer
+                    #
+                    # We do this last since low_level_detection_show modifies
+                    # the image
+                    if self.gst:
+                        low_level_detection_show(frame, detections)
+                        self.gst_next_frame(frame)
 
                 time.sleep(0.5)
             except KeyboardInterrupt:
@@ -618,7 +636,7 @@ if __name__ == "__main__":
 
     if args.record != "":
         # Find previous index
-        record_index = latest_index(args.record, "*")
+        record_index = latest_index(args.record, folders=True)
         # If no images in that directory, use it. If images, increment
         record_dir_prev = os.path.join(args.record, "%05d"%record_index)
         img_index = latest_index(record_dir_prev, "*.jpg")
@@ -628,6 +646,8 @@ if __name__ == "__main__":
         else:
             record_index += 1
             record_dir = os.path.join(args.record, "%05d"%record_index)
+
+        print("Recording to:", record_dir)
 
     # Run detection
     if args.remote:
