@@ -296,15 +296,15 @@ class TFLiteObjectDetector:
 
         num_detections = self.interpreter.get_tensor(self.output_details[3]['index'])
 
-        if output_numpy_concat:
-            # For use in comparing with tflite_numpy.py
-            #
-            # For internals of Interpreter, see:
-            # https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/python/interpreter.py
-            np.save("tflite_official.npy", {
-                self.interpreter._get_tensor_details(i)["name"]: self.interpreter.get_tensor(i) for i in range(176)
-                #self.interpreter._get_tensor_details(i)["name"]: np.copy(self.interpreter.tensor(i)()) for i in range(176)
-            })
+        # if output_numpy_concat:
+        #     # For use in comparing with tflite_numpy.py
+        #     #
+        #     # For internals of Interpreter, see:
+        #     # https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/python/interpreter.py
+        #     np.save("tflite_official.npy", {
+        #         self.interpreter._get_tensor_details(i)["name"]: self.interpreter.get_tensor(i) for i in range(176)
+        #         #self.interpreter._get_tensor_details(i)["name"]: np.copy(self.interpreter.tensor(i)()) for i in range(176)
+        #     })
 
         if not self.floating_model:
             box_scale, box_mean = self.output_details[0]['quantization']
@@ -541,18 +541,27 @@ class LiveObjectDetector(ObjectDetectorBase):
         camera.framerate = framerate
         raw_capture = PiRGBArray(camera, size=self.detector.model_input_dims())
 
-        for input_image in camera.capture_continuous(
-                raw_capture, format="rgb", use_video_port=True,
-                resize=self.detector.model_input_dims()):
-            frame = input_image.array
-            frame.setflags(write=1) # not sure what this does?
+        self.gst_start()
 
-            detections = self.process(frame, frame.shape[1], frame.shape[0])
-            raw_capture.truncate(0)
+        try:
+            for input_image in camera.capture_continuous(
+                    raw_capture, format="rgb", use_video_port=True,
+                    resize=self.detector.model_input_dims()):
+                frame = input_image.array
+                frame.setflags(write=1) # not sure what this does?
 
-            if self.debug:
-                for i, d in enumerate(detections):
-                    print("Result "+str(i)+":", d)
+                detections = self.process(frame, frame.shape[1], frame.shape[0])
+                raw_capture.truncate(0)
+
+                if self.debug:
+                    for i, d in enumerate(detections):
+                        print("Result "+str(i)+":", d)
+
+                self.gst_next_detection(frame, detections)
+        except KeyboardInterrupt:
+            pass
+
+        self.gst_stop()
 
 class OfflineObjectDetector(ObjectDetectorBase):
     """ Run object detection on already captured images """
@@ -560,23 +569,35 @@ class OfflineObjectDetector(ObjectDetectorBase):
         super().__init__(*args, **kwargs)
 
     def run(self, test_image_dir, show_image=True):
+        self.gst_start()
+
         test_images = [os.path.join(d, f) for d, f in find_files(test_image_dir)]
 
-        for i, filename in enumerate(test_images):
-            orig_img = Image.open(filename)
-            resize_img = orig_img.resize(self.detector.model_input_dims())
+        try:
+            for i, filename in enumerate(test_images):
+                orig_img = Image.open(filename)
 
-            orig_img = load_image_into_numpy_array(orig_img)
-            resize_img = load_image_into_numpy_array(resize_img)
+                if orig_img.size == self.detector.model_input_dims():
+                    orig_img = load_image_into_numpy_array(orig_img)
+                    resize_img = orig_img
+                else:
+                    resize_img = orig_img.resize(self.detector.model_input_dims())
+                    orig_img = load_image_into_numpy_array(orig_img)
+                    resize_img = load_image_into_numpy_array(resize_img)
 
-            detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0],
-                    output_numpy_concat=(self.debug and i == len(test_images)-1))
+                detections = self.process(resize_img, orig_img.shape[1], orig_img.shape[0])
+                #        output_numpy_concat=(self.debug and i == len(test_images)-1))
 
-            if self.debug:
-                for i, d in enumerate(detections):
-                    print("Result "+str(i)+":", d)
+                if self.debug:
+                    for i, d in enumerate(detections):
+                        print("Result "+str(i)+":", d)
 
-            detection_show(orig_img, detections, show_image)
+                detection_show(orig_img, detections, show_image)
+                self.gst_next_detection(orig_img, detections)
+        except KeyboardInterrupt:
+            pass
+
+        self.gst_stop()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -664,9 +685,9 @@ if __name__ == "__main__":
             d.run(args.host, args.port, show_image=args.show, record=record_dir)
     elif args.live:
         with LiveObjectDetector(args.model, args.labels,
-                debug=args.debug, lite=args.lite) as d:
+                debug=args.debug, lite=args.lite, gst=args.gst) as d:
             d.run(640, 480, 15)
     elif args.offline:
         with OfflineObjectDetector(args.model, args.labels,
-                debug=args.debug, lite=args.lite) as d:
+                debug=args.debug, lite=args.lite, gst=args.gst) as d:
             d.run(args.images, show_image=args.show)
