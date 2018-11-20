@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,11 +21,13 @@ https://github.com/freedomtan/tensorflow/blob/deeplab_tflite_python/tensorflow/c
 Used to plot results from concat and concat_1 outputs of the official TF Lite
 implementation and my own to compare.
 
-Loads one of two files:
+Loads one of three files -- change the "filename" variable:
     - official implementation: ./object_detection.py --offline --debug --model tflite_float.py
         - outputs tflite_official.npy
     - numpy implementation:    ./tflite_numpy.py
         - outputs tflite_manual.npy
+    - OpenCL implementation:   ./tflite_opencl.py
+        - outputs tflite_opencl.npy
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -128,6 +131,9 @@ def load_test_image(test_image_dir, width=300, height=300,
     return img
 
 if __name__ == "__main__":
+  #filename = "tflite_manual.npy"
+  #filename = "tflite_official.npy"
+  filename = "tflite_opencl.npy"
   label_file = "labels.txt"
   box_prior_file = "box_priors.txt"
   input_mean = 127.5
@@ -137,6 +143,8 @@ if __name__ == "__main__":
   floating_model = True
   show_image = True
   alt_output_order = False
+
+  print("Loading", filename)
 
   # NxHxWxC, H:1, W:2
   height = 300
@@ -154,7 +162,7 @@ if __name__ == "__main__":
   #labels = load_labels(label_file)
   labels = ['???', 'fryingpan']
 
-  data = np.load("tflite_manual.npy").item()
+  data = np.load(filename).item()
   #data = np.load("tflite_official.npy").item()
   #concat = data["concat"]
   #concat_1 = data["concat_1"]

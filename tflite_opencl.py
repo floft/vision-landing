@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Run TF Lite model using numpy rather than the TensorFlow TF Lite implementation
+Run TF Lite model using OpenCL rather than the TensorFlow TF Lite implementation
 
-The goal: code a version so I know for fact that I can load and parse flatbuffer
-and then use the weights, biases, etc. to generate the desired bounding boxes
-and class information on input images.
+The goal: take tflite_numpy.py and replace the numpy calculations with OpenCL
+calculations. This will not be optimized, but it will hopefully generate the
+correct results.
 
-Next step: implement this on the GPU.
+Next step: optimize and test on the RPi Zero.
+
+Usage:
+    time PYOPENCL_CTX= ./tflite_opencl.py
 
 How to use this "reference implementation" (a.k.a. a hacky script):
- - Running this will output tflite_manual.npy
+ - Running this will output tflite_opencl.npy
  - Then run tflite_visualize.py to check the results on the last image in
    test_images (index == -1 at the moment)
 """
@@ -18,6 +21,7 @@ import sys
 import copy
 import flatbuffers
 import numpy as np
+import pyopencl as cl
 from PIL import Image
 from enum import Enum
 
@@ -77,28 +81,6 @@ class TFLite_Detection_PostProcess:
     def __call__(self, input_tensors, input_buffers, options):
         raise NotImplementedError("TFLite_Detection_PostProcess")
 
-def zero_pad(x, pad_before_h, pad_after_h, pad_before_w, pad_after_w):
-    """
-    Input: x (batch_size, n_H, n_W, n_C), padding amount before/after
-    """
-    # Not an integer, must have different padding on either side
-    #if int(pad) != pad:
-    #    pad1 = int(np.floor(pad))
-    #    pad2 = int(np.ceil(pad))
-    #
-    #    #return np.pad(x, ((0,0), (pad1,pad2), (pad1,pad2), (0,0)), 'constant')
-    #    return np.pad(x, ((0,0), (0,pad1+pad2), (0,pad1+pad2), (0,0)), 'constant')
-    # Integer, meaning we can have same padding on both sides
-    #else:
-    #    pad = int(pad)
-    #    #return np.pad(x, ((0,0), (pad,pad), (pad,pad), (0,0)), 'constant')
-    #    return np.pad(x, ((0,0), (0,pad*2), (0,pad*2), (0,0)), 'constant')
-    return np.pad(x, ((0,0), (pad_before_h, pad_after_h), (pad_before_w, pad_after_w), (0,0)), 'constant')
-
-def conv(x, w, b):
-    """ x (f, f, n_C), W (f, f, n_C_prev), b (scalar) """
-    return np.sum(np.multiply(x, w)) + float(b)
-
 def conv2d_tf(x, W, b, stride, pad, out_type):
     """ Check that it's my implementation of this that's the problem """
     pad_name = pad.name # Get "SAME" or "VALID"
@@ -117,7 +99,6 @@ def calc_padding(input_size, filter_size, stride, pad_type):
     """
     if pad_type == Padding.VALID:
         output_size = int((input_size - filter_size + stride) / stride)
-        print(input_size, filter_size, stride)
         pad_before = 0
         pad_after = 0
     elif pad_type == Padding.SAME:
@@ -127,11 +108,6 @@ def calc_padding(input_size, filter_size, stride, pad_type):
         pad_after = pad_needed - pad_before
     else:
         raise NotImplementedError("Only SAME and VALID padding types implemented")
-
-    print("Output size:", output_size, "Pad before:", pad_before, "Pad after:", pad_after)
-    old_calc = int((input_size-filter_size+pad_before+pad_after)/stride)+1
-    if output_size != old_calc:
-        print("Old calc:", old_calc, "New calc:", output_size)
 
     assert output_size >= 0, "output_size must be non-negative after padding"
     return output_size, pad_before, pad_after
@@ -149,57 +125,85 @@ def conv2d_mine(x, W, b, stride, pad, out_type):
     (m, n_H_prev, n_W_prev, n_C_prev) = x.shape
     (f, f, n_C_prev, n_C) = W.shape
 
-    # Dimensions of output volume
-    #n_H = int((n_H_prev-f+2*pad)/stride)+1
-    #n_W = int((n_W_prev-f+2*pad)/stride)+1
-    #n_H = int(np.ceil((n_H_prev - f + 1) / stride))
-    #n_W = int(np.ceil((n_W_prev - f + 1) / stride))
-
-    # Pad input
+    # Calculate padding
     n_H, pad_before_h, pad_after_h = calc_padding(n_H_prev, f, stride, pad)
     n_W, pad_before_w, pad_after_w = calc_padding(n_W_prev, f, stride, pad)
-    A_prev_pad = zero_pad(x, pad_before_h, pad_after_h, pad_before_w, pad_after_w)
 
-    # Init output with zeros
-    output = np.zeros((m,n_H,n_W,n_C), dtype=out_type)
+    # Init output of correct shape
+    output = np.empty((m,n_H,n_W,n_C), dtype=out_type)
 
-    for i in range(m): # over batches (probably only 1)
-        a_prev_pad = A_prev_pad[i,:,:,:]
-        for h in range(n_H):         # vertical axis
-            for w in range(n_W):     # horiz axis
-                for c in range(n_C): # for each output filter
-                    # Portion of image for input to convolution
-                    assert h*stride+f <= a_prev_pad.shape[0], "out of bounds"
-                    assert w*stride+f <= a_prev_pad.shape[1], "out of bounds"
-                    a_slice_prev = a_prev_pad[h*stride:h*stride+f, w*stride:w*stride+f, :]
-                    # Convolve
-                    assert len(b.shape) == 1, "Assuming single bias per channel/filter"
-                    output[i, h, w, c] = conv(a_slice_prev, W[:,:,:,c], b[c])
+    ctx = cl.create_some_context()
+    queue = cl.CommandQueue(ctx)
 
-    # https://github.com/tensorflow/tensorflow/blob/r1.11/tensorflow/contrib/lite/kernels/internal/reference/reference_ops.h#L193
-    """
-    for batch in range(m):
-        for out_y in range(n_H):
-            for out_x in range(n_W):
-                for out_channel in range(n_C):
-                    in_x_origin = out_x * stride - int(pad)
-                    in_y_origin = out_y * stride - int(pad)
-                    total = 0.0
+    prg = cl.Program(ctx, """
+    __kernel void conv2d(
+        const int m, const int n_H, const int n_W, const int n_C,
+        const int stride, const int filter_dim,
+        const int pad_before_w, const int pad_before_h,
+        const int pad_after_w, const int pad_after_h,
+        const int n_H_prev, const int n_W_prev, const int n_C_prev,
+        __global const float* x, __global const float* w, __global const float* b,
+        __global float* output)
+    {
+        const int out_y = get_global_id(0);
+        const int out_x = get_global_id(1);
+        const int out_channel = get_global_id(2);
+        const int in_x_origin = out_x*stride - pad_before_w;
+        const int in_y_origin = out_y*stride - pad_before_h;
 
-                    for filter_y in range(f):
-                        for filter_x in range(f):
-                            in_x = in_x_origin + filter_x
-                            in_y = in_y_origin + filter_y
+        // x offsets
+        const int xo1 = n_H_prev*n_W_prev*n_C_prev;
+        const int xo2 = n_W_prev*n_C_prev;
+        const int xo3 = n_C_prev;
 
-                            if in_x >= 0 and in_y >= 0 and in_x < n_W_prev and in_y < n_H_prev:
-                                for in_channel in range(n_C_prev):
-                                        input_value = x[batch, in_y, in_x, in_channel]
-                                        filter_value = W[filter_y, filter_x, in_channel, out_channel]
+        // w offsets
+        const int wo1 = filter_dim*n_C_prev*n_C;
+        const int wo2 = n_C_prev*n_C;
+        const int wo3 = n_C;
 
-                                        total += input_value * filter_value
+        // output offsets
+        const int oo1 = n_H*n_W*n_C;
+        const int oo2 = n_W*n_C;
+        const int oo3 = n_C;
 
-                    output[batch, out_y, out_x, out_channel] = total + b[out_channel]
-    """
+        for (int batch = 0; batch < m; ++batch) {
+            float total = 0;
+
+            for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                    const int in_x = in_x_origin + filter_x;
+                    const int in_y = in_y_origin + filter_y;
+
+                    if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                        for (int in_channel = 0; in_channel < n_C_prev; ++in_channel) {
+                            const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + in_channel];
+                            const float filter_value = w[filter_y*wo1 + filter_x*wo2 + in_channel*wo3 + out_channel];
+
+                            total += input_value * filter_value;
+                        }
+                    }
+                }
+            }
+
+            output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = total + b[out_channel];
+        }
+    }
+    """).build()
+
+    mf = cl.mem_flags
+    x_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(x))
+    w_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(W))
+    b_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(b))
+    out_buf = cl.Buffer(ctx, mf.WRITE_ONLY, output.nbytes)
+
+    prg.conv2d(queue, (n_H,n_W,n_C), None,
+        np.int32(m), np.int32(n_H), np.int32(n_W), np.int32(n_C),
+        np.int32(stride), np.int32(f),
+        np.int32(pad_before_w), np.int32(pad_before_h),
+        np.int32(pad_after_w), np.int32(pad_after_h),
+        np.int32(n_H_prev), np.int32(n_W_prev), np.int32(n_C_prev),
+        x_buf, w_buf, b_buf, out_buf)
+    cl.enqueue_copy(queue, output, out_buf)
 
     return output
 
@@ -225,29 +229,83 @@ def depthwise_conv2d_mine(x, W, b, stride, pad, out_type):
     (f, f, n_C_prev, n_C) = W.shape
     assert n_C == 1, "first dimension == 1 for depthwise conv2d weights"
 
-    # Dimensions of output volume
-    #n_H = int((n_H_prev-f+2*pad)/stride)+1
-    #n_W = int((n_W_prev-f+2*pad)/stride)+1
-
-    # Pad input
+    # Calculate padding
     n_H, pad_before_h, pad_after_h = calc_padding(n_H_prev, f, stride, pad)
     n_W, pad_before_w, pad_after_w = calc_padding(n_W_prev, f, stride, pad)
-    A_prev_pad = zero_pad(x, pad_before_h, pad_after_h, pad_before_w, pad_after_w)
 
-    # Init output with zeros
-    output = np.zeros((m,n_H,n_W,n_C_prev), dtype=out_type)
+    # Init output of correct shape
+    output = np.empty((m,n_H,n_W,n_C_prev), dtype=out_type)
 
-    for i in range(m): # over batches (probably only 1)
-        a_prev_pad = A_prev_pad[i,:,:,:]
-        for h in range(n_H):         # vertical axis
-            for w in range(n_W):     # horiz axis
-                for c in range(n_C_prev): # for each output filter (same as # of input filters)
-                    # Portion of image for input to convolution
-                    a_slice_prev = a_prev_pad[h*stride:h*stride+f, w*stride:w*stride+f, c]
-                    # Convolve
-                    assert W.shape[3] == 1, "Assuming W.shape[3] == 1"
-                    assert len(b.shape) == 1, "Assuming single bias per channel/filter"
-                    output[i, h, w, c] = conv(a_slice_prev, W[:,:,c,0], b[c])
+    ctx = cl.create_some_context()
+    queue = cl.CommandQueue(ctx)
+
+    prg = cl.Program(ctx, """
+    __kernel void depthwise_conv2d(
+        const int m, const int n_H, const int n_W, const int n_C,
+        const int stride, const int filter_dim,
+        const int pad_before_w, const int pad_before_h,
+        const int pad_after_w, const int pad_after_h,
+        const int n_H_prev, const int n_W_prev, const int n_C_prev,
+        __global const float* x, __global const float* w, __global const float* b,
+        __global float* output)
+    {
+        const int out_y = get_global_id(0);
+        const int out_x = get_global_id(1);
+        const int out_channel = get_global_id(2);
+        const int in_x_origin = out_x*stride - pad_before_w;
+        const int in_y_origin = out_y*stride - pad_before_h;
+
+        // x offsets
+        const int xo1 = n_H_prev*n_W_prev*n_C_prev;
+        const int xo2 = n_W_prev*n_C_prev;
+        const int xo3 = n_C_prev;
+
+        // w offsets
+        const int wo1 = filter_dim*n_C_prev*n_C;
+        const int wo2 = n_C_prev*n_C;
+        const int wo3 = n_C;
+
+        // output offsets
+        const int oo1 = n_H*n_W*n_C_prev;
+        const int oo2 = n_W*n_C_prev;
+        const int oo3 = n_C_prev;
+
+        for (int batch = 0; batch < m; ++batch) {
+            float total = 0;
+
+            for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                    const int in_x = in_x_origin + filter_x;
+                    const int in_y = in_y_origin + filter_y;
+
+                    if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                        const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + out_channel];
+                        const float filter_value = w[filter_y*wo1 + filter_x*wo2 + out_channel*wo3 + 0];
+
+                        total += input_value * filter_value;
+                    }
+                }
+            }
+
+            output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = total + b[out_channel];
+        }
+    }
+    """).build()
+
+    mf = cl.mem_flags
+    x_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(x))
+    w_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(W))
+    b_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(b))
+    out_buf = cl.Buffer(ctx, mf.WRITE_ONLY, output.nbytes)
+
+    prg.depthwise_conv2d(queue, (n_H,n_W,n_C_prev), None,
+        np.int32(m), np.int32(n_H), np.int32(n_W), np.int32(n_C),
+        np.int32(stride), np.int32(f),
+        np.int32(pad_before_w), np.int32(pad_before_h),
+        np.int32(pad_after_w), np.int32(pad_after_h),
+        np.int32(n_H_prev), np.int32(n_W_prev), np.int32(n_C_prev),
+        x_buf, w_buf, b_buf, out_buf)
+    cl.enqueue_copy(queue, output, out_buf)
 
     return output
 
@@ -276,7 +334,6 @@ class Conv:
 
         n = input_data.shape[1] # width (or height, since same)
         f = weights.shape[1] # fxf filter
-        #padding = options["padding"](n, f, stride)
         padding = options["padding"]
         self.options = options
 
@@ -709,7 +766,7 @@ def run_model(model, input_data):
         elif t["name"] == "convert_scores":
             prediction_classes = bufs[t["buffer"]]
 
-    np.save("tflite_manual.npy", {
+    np.save("tflite_opencl.npy", {
         t["name"]: bufs[t["buffer"]] for t in tensors
     })
     print("Total number of tensors:", len(tensors))

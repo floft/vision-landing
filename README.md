@@ -32,7 +32,7 @@ First, copy your *detect_quantized.tflite* or whatever model you want to use to 
 Raspberry Pi.
 
     sudo apt install python3-matplotlib python3-pil libxml2-dev libxslt-dev
-    sudo pip3 install tensorflow pymavlink
+    sudo pip3 install tensorflow pymavlink flatbuffers
     rsync -Pahuv ./ rpiz:vision-landing/
 
     ssh rpiz
