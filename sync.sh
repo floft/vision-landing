@@ -2,4 +2,10 @@
 #
 # Sync files to RPi Zero
 #
-rsync -Pahuv --exclude="record" ./ rpiz:vision-landing/
+rsync -Pahuv \
+    --exclude="record" \
+    --exclude="calibration*" \
+    --exclude="exported_models*" \
+    --exclude="__pycache__" \
+    --exclude="*.npy*" \
+    ./ rpiz:vision-landing/

@@ -4,9 +4,10 @@ test/
 *.tflite
 *.zip
 calibration*/
-*.npy
+*.npy*
 __pycache__/
 .vscode
 *.jpg
 *.mp4
 *.param
+results.txt

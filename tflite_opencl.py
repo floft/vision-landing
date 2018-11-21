@@ -255,6 +255,7 @@ class TFLiteOpenCL:
 
     def load(self, filename):
         """ Run model on given input data """
+        print("Loading model")
         assert not self.loaded, "Cannot load multiple models"
         self.loaded = True
 
@@ -466,6 +467,7 @@ class TFLiteOpenCL:
         #    buf = t["buffer"]
         #    results.append(buf)
 
+        print("Allocating buffers")
         # Allocate all the buffers that we determined we'll need to run
         self.allocate_buffers()
 
@@ -514,6 +516,7 @@ class TFLiteOpenCL:
         return self.bufs[buf]
 
     def run(self, input_data):
+        print("Running model")
         assert self.loaded, "Must have a model loaded first"
 
         assert all(input_data.shape == self.input_shape), \
@@ -527,24 +530,36 @@ class TFLiteOpenCL:
             mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=self.bufs[self.input_buffer])
 
         with cl.CommandQueue(self.ctx) as queue:
-            # Run
-            for op in self.operations:
+            # Enqueue operations
+            for i, op in enumerate(self.operations):
+                print("Enqueing op", i)
+                t = time.time()
                 self.enqueue_op(queue, op)
+                t = time.time() - t
+                print("Took", t, "s")
 
                 # TODO do I need a cl.enqueue_barrier(queue)?
                 # or maybe cl.wait_for_events(event) and handle which outputs
                 # are used for certain inputs?
-                #cl.enqueue_barrier(queue)
+                cl.enqueue_barrier(queue)
 
             # Get different output not requiring the custom op
+            #
+            # Note: only when we request the result does it actually run the
+            # network, so this takes a long time
             prediction_boxes = None
             prediction_classes = None
 
-            for t in self.tensors:
-                if t["name"] == "Squeeze":
-                    prediction_boxes = self.load_buf(queue, t["buffer"])
-                elif t["name"] == "convert_scores":
-                    prediction_classes = self.load_buf(queue, t["buffer"])
+            print("Fetching results")
+            t = time.time()
+            for tensor in self.tensors:
+                buf = tensor["buffer"]
+                if tensor["name"] == "Squeeze":
+                    prediction_boxes = self.load_buf(queue, buf)
+                elif tensor["name"] == "convert_scores":
+                    prediction_classes = self.load_buf(queue, buf)
+            t = time.time() - t
+            print("Took", t, "s")
 
         # Note: only the prediction boxes/classes buffers will have valid data
         # in them though unless we load *all* the buffers in the above for loop
