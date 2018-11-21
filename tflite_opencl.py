@@ -73,25 +73,10 @@ class TFLiteOpenCL:
          * Non-linear functions -- compute function element-wise (so interpet
          * as a 1D array)
          */
-        __kernel void relu6(__global const float* input, __global float* output)
-        {
-            const int id = get_global_id(0);
-            output[id] = fmin(fmax(input[id], 0), 6);
-        }
-
         __kernel void logistic(__global const float* input, __global float* output)
         {
             const int id = get_global_id(0);
             output[id] = 1.0 / (1.0 + exp(-input[id]));
-        }
-
-        /*
-         * Reshaping does nothing except we reinterpret the output, so just copy
-         */
-        __kernel void copy(__global const float* input, __global float* output)
-        {
-            const int id = get_global_id(0);
-            output[id] = input[id];
         }
 
         /*
@@ -144,7 +129,6 @@ class TFLiteOpenCL:
             const int in_y_origin = out_y*stride - pad_before_h;
 
             // x offsets
-            const int xo1 = n_H_prev*n_W_prev*n_C_prev;
             const int xo2 = n_W_prev*n_C_prev;
             const int xo3 = n_C_prev;
 
@@ -154,31 +138,28 @@ class TFLiteOpenCL:
             const int wo3 = n_C;
 
             // output offsets
-            const int oo1 = n_H*n_W*n_C;
             const int oo2 = n_W*n_C;
             const int oo3 = n_C;
 
-            for (int batch = 0; batch < m; ++batch) {
-                float total = 0;
+            float total = 0;
 
-                for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
-                    for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
-                        const int in_x = in_x_origin + filter_x;
-                        const int in_y = in_y_origin + filter_y;
+            for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                    const int in_x = in_x_origin + filter_x;
+                    const int in_y = in_y_origin + filter_y;
 
-                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
-                            for (int in_channel = 0; in_channel < n_C_prev; ++in_channel) {
-                                const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + in_channel];
-                                const float filter_value = w[filter_y*wo1 + filter_x*wo2 + in_channel*wo3 + out_channel];
+                    if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                        for (int in_channel = 0; in_channel < n_C_prev; ++in_channel) {
+                            const float input_value = x[in_y*xo2 + in_x*xo3 + in_channel];
+                            const float filter_value = w[filter_y*wo1 + filter_x*wo2 + in_channel*wo3 + out_channel];
 
-                                total += input_value * filter_value;
-                            }
+                            total += input_value * filter_value;
                         }
                     }
                 }
-
-                output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = total + b[out_channel];
             }
+
+            output[out_y*oo2 + out_x*oo3 + out_channel] = total + b[out_channel];
         }
 
         __kernel void conv2d_relu6(
@@ -197,7 +178,6 @@ class TFLiteOpenCL:
             const int in_y_origin = out_y*stride - pad_before_h;
 
             // x offsets
-            const int xo1 = n_H_prev*n_W_prev*n_C_prev;
             const int xo2 = n_W_prev*n_C_prev;
             const int xo3 = n_C_prev;
 
@@ -207,31 +187,28 @@ class TFLiteOpenCL:
             const int wo3 = n_C;
 
             // output offsets
-            const int oo1 = n_H*n_W*n_C;
             const int oo2 = n_W*n_C;
             const int oo3 = n_C;
 
-            for (int batch = 0; batch < m; ++batch) {
-                float total = 0;
+            float total = 0;
 
-                for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
-                    for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
-                        const int in_x = in_x_origin + filter_x;
-                        const int in_y = in_y_origin + filter_y;
+            for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                    const int in_x = in_x_origin + filter_x;
+                    const int in_y = in_y_origin + filter_y;
 
-                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
-                            for (int in_channel = 0; in_channel < n_C_prev; ++in_channel) {
-                                const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + in_channel];
-                                const float filter_value = w[filter_y*wo1 + filter_x*wo2 + in_channel*wo3 + out_channel];
+                    if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                        for (int in_channel = 0; in_channel < n_C_prev; ++in_channel) {
+                            const float input_value = x[in_y*xo2 + in_x*xo3 + in_channel];
+                            const float filter_value = w[filter_y*wo1 + filter_x*wo2 + in_channel*wo3 + out_channel];
 
-                                total += input_value * filter_value;
-                            }
+                            total += input_value * filter_value;
                         }
                     }
                 }
-
-                output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = fmin(fmax(total + b[out_channel], 0), 6);
             }
+
+            output[out_y*oo2 + out_x*oo3 + out_channel] = fmin(fmax(total + b[out_channel], 0), 6);
         }
 
         /*
@@ -258,7 +235,6 @@ class TFLiteOpenCL:
             const int in_y_origin = out_y*stride - pad_before_h;
 
             // x offsets
-            const int xo1 = n_H_prev*n_W_prev*n_C_prev;
             const int xo2 = n_W_prev*n_C_prev;
             const int xo3 = n_C_prev;
 
@@ -268,29 +244,26 @@ class TFLiteOpenCL:
             const int wo3 = n_C;
 
             // output offsets
-            const int oo1 = n_H*n_W*n_C_prev;
             const int oo2 = n_W*n_C_prev;
             const int oo3 = n_C_prev;
 
-            for (int batch = 0; batch < m; ++batch) {
-                float total = 0;
+            float total = 0;
 
-                for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
-                    for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
-                        const int in_x = in_x_origin + filter_x;
-                        const int in_y = in_y_origin + filter_y;
+            for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                    const int in_x = in_x_origin + filter_x;
+                    const int in_y = in_y_origin + filter_y;
 
-                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
-                            const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + out_channel];
-                            const float filter_value = w[filter_y*wo1 + filter_x*wo2 + out_channel*wo3 + 0];
+                    if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                        const float input_value = x[in_y*xo2 + in_x*xo3 + out_channel];
+                        const float filter_value = w[filter_y*wo1 + filter_x*wo2 + out_channel*wo3 + 0];
 
-                            total += input_value * filter_value;
-                        }
+                        total += input_value * filter_value;
                     }
                 }
-
-                output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = total + b[out_channel];
             }
+
+            output[out_y*oo2 + out_x*oo3 + out_channel] = total + b[out_channel];
         }
 
         __kernel void depthwise_conv2d_relu6(
@@ -309,7 +282,6 @@ class TFLiteOpenCL:
             const int in_y_origin = out_y*stride - pad_before_h;
 
             // x offsets
-            const int xo1 = n_H_prev*n_W_prev*n_C_prev;
             const int xo2 = n_W_prev*n_C_prev;
             const int xo3 = n_C_prev;
 
@@ -319,31 +291,28 @@ class TFLiteOpenCL:
             const int wo3 = n_C;
 
             // output offsets
-            const int oo1 = n_H*n_W*n_C_prev;
             const int oo2 = n_W*n_C_prev;
             const int oo3 = n_C_prev;
 
-            for (int batch = 0; batch < m; ++batch) {
-                float total = 0;
+            float total = 0;
 
-                for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
-                    for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
-                        const int in_x = in_x_origin + filter_x;
-                        const int in_y = in_y_origin + filter_y;
+            for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                    const int in_x = in_x_origin + filter_x;
+                    const int in_y = in_y_origin + filter_y;
 
-                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
-                            const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + out_channel];
-                            const float filter_value = w[filter_y*wo1 + filter_x*wo2 + out_channel*wo3 + 0];
+                    if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                        const float input_value = x[in_y*xo2 + in_x*xo3 + out_channel];
+                        const float filter_value = w[filter_y*wo1 + filter_x*wo2 + out_channel*wo3 + 0];
 
-                            total += input_value * filter_value;
-                        }
+                        total += input_value * filter_value;
                     }
                 }
-
-                output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = fmin(fmax(total + b[out_channel], 0), 6);
             }
+
+            output[out_y*oo2 + out_x*oo3 + out_channel] = fmin(fmax(total + b[out_channel], 0), 6);
         }
-        """).build()
+        """).build(["-cl-finite-math-only", "-cl-unsafe-math-optimizations"])
 
         # List of what to do
         self.operations = []
