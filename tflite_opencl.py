@@ -351,6 +351,9 @@ class TFLiteOpenCL:
         self.weight_buffers = []
         # Set (no duplicates) of the IDs of the buffers we need for input/output
         self.need_buffer = set()
+        # Reshapes don't do anything, so just make buffer list substitutions
+        # This is a list of (a,b) tuples replacing a with b
+        self.buffer_replacements = []
 
         # Load model now if provided, otherwise manually call load() later
         self.loaded = False
@@ -402,10 +405,11 @@ class TFLiteOpenCL:
 
             # Check we're only using exiting tensors
             for t in input_tensors:
+                buf = self.replace_buffers(t["buffer"]) # buffer replacements
                 # Some are by default just a 0, so make sure it's not when we use it
-                assert not isinstance(self.bufs[t["buffer"]], int), \
-                    "Input buffer "+str(t["buffer"])+" must be defined by time it's used: "+ \
-                    str(self.bufs[t["buffer"]])
+                assert not isinstance(self.bufs[buf], int), \
+                    "Input buffer "+str(buf)+" must be defined by time it's used: "+ \
+                    str(self.bufs[buf])
 
             input_buffers = self.get_tensor_buffers(self.bufs, input_tensors)
 
@@ -456,7 +460,7 @@ class TFLiteOpenCL:
                     np.int32(pad_after_w), np.int32(pad_after_h),
                     np.int32(n_H_prev), np.int32(n_W_prev), np.int32(n_C_prev))
                 cl_weights = (w_buf, b_buf) # only used once, so create buffer here
-                cl_inputs = (input_tensors[0]["buffer"],)
+                cl_inputs = self.replace_buffers([input_tensors[0]["buffer"]])
                 cl_output = output_buffer
 
                 # Used multiple times, so allocate later
@@ -476,7 +480,7 @@ class TFLiteOpenCL:
             elif op == Operation.LOGISTIC:
                 assert len(input_buffers) == 1, "Logistic assumes single input"
                 x = input_buffers[0]
-                cl_inputs = (input_tensors[0]["buffer"],)
+                cl_inputs = self.replace_buffers([input_tensors[0]["buffer"]])
                 cl_output = output_buffer
                 self.operations.append((
                     op,
@@ -497,25 +501,31 @@ class TFLiteOpenCL:
                 assert all(input_buffers[1] == options["shape"]), \
                     "input_buffers[1] != options[\"shape\"]"
 
-                x = input_buffers[0]
-                cl_inputs = (input_tensors[0]["buffer"],)
-                cl_output = output_buffer
-                self.operations.append((
-                    op,
-                    None,
-                    (np.prod(x.shape),), # treat as 1D array
-                    (), (), # no custom args/weights
-                    cl_inputs,
-                    cl_output
-                ))
-                for i in cl_inputs:
-                    self.need_buffer.add(i)
-                self.need_buffer.add(cl_output)
+                in_buf = input_tensors[0]["buffer"]
+                out_buf = output_buffer
+                # Replace all out_buf with in_buf
+                self.buffer_replacements.append((out_buf, in_buf))
+                output_empty = None
 
-                # Calculate shape with numpy -- inefficient but we only do this
-                # at start, not when processing frames
-                new_shape = np.reshape(input_buffers[0], options["shape"]).astype(options["out_type"]).shape
-                output_empty = np.empty(new_shape).astype(options["out_type"])
+                # x = input_buffers[0]
+                # cl_inputs = (input_tensors[0]["buffer"],)
+                # cl_output = output_buffer
+                # self.operations.append((
+                #     op,
+                #     None,
+                #     (np.prod(x.shape),), # treat as 1D array
+                #     (), (), # no custom args/weights
+                #     cl_inputs,
+                #     cl_output
+                # ))
+                # for i in cl_inputs:
+                #     self.need_buffer.add(i)
+                # self.need_buffer.add(cl_output)
+
+                # # Calculate shape with numpy -- inefficient but we only do this
+                # # at start, not when processing frames
+                # new_shape = np.reshape(input_buffers[0], options["shape"]).astype(options["out_type"]).shape
+                # output_empty = np.empty(new_shape).astype(options["out_type"])
             elif op == Operation.CONCAT:
                 assert len(input_buffers) == 6, \
                     "Only support concat 6 at the moment"
@@ -527,7 +537,7 @@ class TFLiteOpenCL:
                     assert len([i for i in b.shape if i is not 1]) == 2, \
                         "Only support concat with 2 non-1 axes at the moment"
 
-                cl_inputs = [i["buffer"] for i in input_tensors]
+                cl_inputs = self.replace_buffers([i["buffer"] for i in input_tensors])
                 cl_output = output_buffer
                 self.operations.append((
                     op,
@@ -548,15 +558,16 @@ class TFLiteOpenCL:
                 new_shape = np.concatenate(input_buffers, options["axis"]).astype(options["out_type"]).shape
                 output_empty = np.empty(new_shape).astype(options["out_type"])
 
-            # Find the output buffer for this operation
-            assert len(operator["outputs"]) == 1, \
-                "Only support single output at the moment"
+            if output_empty is not None:
+                # Find the output buffer for this operation
+                assert len(operator["outputs"]) == 1, \
+                    "Only support single output at the moment"
 
-            # Save the newly-created output buffer to our list of buffers
-            assert all(output_empty.shape == output_tensor["shape"]), \
-                "Output data must be of shape "+str(output_tensor["shape"])+\
-                " but is of shape "+str(output_empty.shape)
-            self.bufs[output_buffer] = output_empty
+                # Save the newly-created output buffer to our list of buffers
+                assert all(output_empty.shape == output_tensor["shape"]), \
+                    "Output data must be of shape "+str(output_tensor["shape"])+\
+                    " but is of shape "+str(output_empty.shape)
+                self.bufs[output_buffer] = output_empty
 
         # Get output
         #results = []
@@ -569,6 +580,37 @@ class TFLiteOpenCL:
         print("Allocating buffers")
         # Allocate all the buffers that we determined we'll need to run
         self.allocate_buffers()
+
+    def replace_buffers(self, bufs):
+        """ Buffer replacements to get rid of the need of reshapes """
+        new_bufs = []
+
+        # Also allow passing in only a single buffer to make the replacements
+        is_list = True
+
+        if not isinstance(bufs, list):
+            is_list = False
+            bufs = [bufs]
+
+        # Make replacements
+        for buf in bufs:
+            found = False
+
+            # Make replacement if in the list
+            for a,b in self.buffer_replacements:
+                if buf == a:
+                    found = True
+                    new_bufs.append(b)
+
+            # No replacement, just copy it
+            if not found:
+                new_bufs.append(buf)
+
+        # If we didn't pass in a list, then just return the single item
+        if not is_list:
+            return new_bufs[0]
+        else:
+            return new_bufs
 
     def allocate_buffers(self):
         """ Create OpenCL buffers for the needed I/O buffers """
@@ -656,7 +698,7 @@ class TFLiteOpenCL:
             print("Fetching results")
             t = time.time()
             for tensor in self.tensors:
-                buf = tensor["buffer"]
+                buf = self.replace_buffers(tensor["buffer"])
                 if tensor["name"] == "Squeeze":
                     prediction_boxes = self.load_buf(queue, buf)
                 elif tensor["name"] == "convert_scores":
@@ -944,7 +986,7 @@ class TFLiteOpenCL:
 
         for t in tensors:
             # Reinterpret bytes as correct type and reshape
-            buf = bufs[t["buffer"]]
+            buf = bufs[self.replace_buffers(t["buffer"])]
             buf = np.frombuffer(buf, dtype=t["type"]).reshape(t["shape"])
             buffers.append(buf)
 
