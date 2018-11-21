@@ -42,7 +42,7 @@ from image import find_files, load_image_into_numpy_array
 
 Padding = Enum("Padding", "VALID SAME")
 Activation = Enum("Activation", "NONE RELU6")
-Operation = Enum("Operation", "CONCAT RESHAPE LOGISTIC CONV2D DEPTHWISECONV2D POSTPROCESS RELU6")
+Operation = Enum("Operation", "CONCAT RESHAPE LOGISTIC CONV2D DEPTHWISECONV2D POSTPROCESS")
 
 def load_test_image(test_image_dir, width=300, height=300,
         input_mean=127.5, input_std=127.5, index=-1):
@@ -181,6 +181,59 @@ class TFLiteOpenCL:
             }
         }
 
+        __kernel void conv2d_relu6(
+            const int m, const int n_H, const int n_W, const int n_C,
+            const int stride, const int filter_dim,
+            const int pad_before_w, const int pad_before_h,
+            const int pad_after_w, const int pad_after_h,
+            const int n_H_prev, const int n_W_prev, const int n_C_prev,
+            __global const float* x, __global const float* w, __global const float* b,
+            __global float* output)
+        {
+            const int out_y = get_global_id(0);
+            const int out_x = get_global_id(1);
+            const int out_channel = get_global_id(2);
+            const int in_x_origin = out_x*stride - pad_before_w;
+            const int in_y_origin = out_y*stride - pad_before_h;
+
+            // x offsets
+            const int xo1 = n_H_prev*n_W_prev*n_C_prev;
+            const int xo2 = n_W_prev*n_C_prev;
+            const int xo3 = n_C_prev;
+
+            // w offsets
+            const int wo1 = filter_dim*n_C_prev*n_C;
+            const int wo2 = n_C_prev*n_C;
+            const int wo3 = n_C;
+
+            // output offsets
+            const int oo1 = n_H*n_W*n_C;
+            const int oo2 = n_W*n_C;
+            const int oo3 = n_C;
+
+            for (int batch = 0; batch < m; ++batch) {
+                float total = 0;
+
+                for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                    for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                        const int in_x = in_x_origin + filter_x;
+                        const int in_y = in_y_origin + filter_y;
+
+                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                            for (int in_channel = 0; in_channel < n_C_prev; ++in_channel) {
+                                const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + in_channel];
+                                const float filter_value = w[filter_y*wo1 + filter_x*wo2 + in_channel*wo3 + out_channel];
+
+                                total += input_value * filter_value;
+                            }
+                        }
+                    }
+                }
+
+                output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = fmin(fmax(total + b[out_channel], 0), 6);
+            }
+        }
+
         /*
          * Depthwise Conv2d
          * See "MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications"
@@ -237,6 +290,57 @@ class TFLiteOpenCL:
                 }
 
                 output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = total + b[out_channel];
+            }
+        }
+
+        __kernel void depthwise_conv2d_relu6(
+            const int m, const int n_H, const int n_W, const int n_C,
+            const int stride, const int filter_dim,
+            const int pad_before_w, const int pad_before_h,
+            const int pad_after_w, const int pad_after_h,
+            const int n_H_prev, const int n_W_prev, const int n_C_prev,
+            __global const float* x, __global const float* w, __global const float* b,
+            __global float* output)
+        {
+            const int out_y = get_global_id(0);
+            const int out_x = get_global_id(1);
+            const int out_channel = get_global_id(2);
+            const int in_x_origin = out_x*stride - pad_before_w;
+            const int in_y_origin = out_y*stride - pad_before_h;
+
+            // x offsets
+            const int xo1 = n_H_prev*n_W_prev*n_C_prev;
+            const int xo2 = n_W_prev*n_C_prev;
+            const int xo3 = n_C_prev;
+
+            // w offsets
+            const int wo1 = filter_dim*n_C_prev*n_C;
+            const int wo2 = n_C_prev*n_C;
+            const int wo3 = n_C;
+
+            // output offsets
+            const int oo1 = n_H*n_W*n_C_prev;
+            const int oo2 = n_W*n_C_prev;
+            const int oo3 = n_C_prev;
+
+            for (int batch = 0; batch < m; ++batch) {
+                float total = 0;
+
+                for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                    for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                        const int in_x = in_x_origin + filter_x;
+                        const int in_y = in_y_origin + filter_y;
+
+                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                            const float input_value = x[batch*xo1 + in_y*xo2 + in_x*xo3 + out_channel];
+                            const float filter_value = w[filter_y*wo1 + filter_x*wo2 + out_channel*wo3 + 0];
+
+                            total += input_value * filter_value;
+                        }
+                    }
+                }
+
+                output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = fmin(fmax(total + b[out_channel], 0), 6);
             }
         }
         """).build()
@@ -362,21 +466,13 @@ class TFLiteOpenCL:
 
                 self.operations.append((
                     op,
+                    activation,
                     cl_ndrange,
                     cl_args,
                     cl_weights,
                     cl_inputs,
                     cl_output
                 ))
-
-                if activation == Activation.RELU6:
-                    # Execute the activation function after the convolution
-                    self.operations.append((
-                        Operation.RELU6,
-                        (np.prod(output_empty.shape),), # treat as 1D array
-                        (), (), # no custom args/weights
-                        (output_buffer,), output_buffer # input/output to same buffer
-                    ))
             elif op == Operation.LOGISTIC:
                 assert len(input_buffers) == 1, "Logistic assumes single input"
                 x = input_buffers[0]
@@ -384,6 +480,7 @@ class TFLiteOpenCL:
                 cl_output = output_buffer
                 self.operations.append((
                     op,
+                    None,
                     (np.prod(x.shape),), # treat as 1D array
                     (), (), # no custom args/weights
                     cl_inputs,
@@ -405,6 +502,7 @@ class TFLiteOpenCL:
                 cl_output = output_buffer
                 self.operations.append((
                     op,
+                    None,
                     (np.prod(x.shape),), # treat as 1D array
                     (), (), # no custom args/weights
                     cl_inputs,
@@ -433,6 +531,7 @@ class TFLiteOpenCL:
                 cl_output = output_buffer
                 self.operations.append((
                     op,
+                    None,
                     (1,), # TODO can we parallelize this?
                     # size of each interpreted as a 1D array passed in as args
                     tuple([np.int32(np.prod(i.shape)) for i in input_buffers]),
@@ -482,18 +581,22 @@ class TFLiteOpenCL:
             self.opencl_bufs[buf] = cl_buf
 
     def enqueue_op(self, queue, op):
-        cl_op, cl_ndrange, cl_args, cl_weights, cl_inputs, cl_output = op
+        cl_op, cl_act, cl_ndrange, cl_args, cl_weights, cl_inputs, cl_output = op
 
         if cl_op == Operation.POSTPROCESS:
             return # Skip post process for now
         elif cl_op == Operation.CONV2D:
-            f = self.prg.conv2d
+            if cl_act == Activation.RELU6:
+                f = self.prg.conv2d_relu6
+            else:
+                f = self.prg.conv2d
         elif cl_op == Operation.DEPTHWISECONV2D:
-            f = self.prg.depthwise_conv2d
+            if cl_act == Activation.RELU6:
+                f = self.prg.depthwise_conv2d_relu6
+            else:
+                f = self.prg.depthwise_conv2d
         elif cl_op == Operation.LOGISTIC:
             f = self.prg.logistic
-        elif cl_op == Operation.RELU6:
-            f = self.prg.relu6
         elif cl_op == Operation.RESHAPE:
             f = self.prg.copy
         elif cl_op == Operation.CONCAT:
