@@ -609,7 +609,7 @@ class TFLiteOpenCL:
         elif cl_op == Operation.LOGISTIC:
             f = self.prg.logistic
         elif cl_op == Operation.RESHAPE:
-            f = self.prg.copy
+            return
         elif cl_op == Operation.CONCAT:
             f = self.prg.concat612
 
@@ -992,7 +992,7 @@ class TFLiteOpenCL:
 
 if __name__ == "__main__":
     img = load_test_image("test_images")
-    model = TFLiteOpenCL("detect_float.tflite", img.shape)
+    model = TFLiteOpenCL("detect_float.tflite")
 
     t = time.time()
     model.run(img)
