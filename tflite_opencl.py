@@ -378,13 +378,12 @@ class TFLiteOpenCL:
                     const int in_y = in_y_origin + filter_y;
 
                     for (int c = 0; c < n_C_prev; ++c) {
-                        float value = 0;
-
-                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
-                            value = x[in_y*xo2 + in_x*xo3 + c];
-                        }
-
-                        output[out_y*oo1 + out_x*oo2 + filter_y*oo3 + filter_x*oo4 + c] = value;
+                        // I get "Optimizer: Filling dynamically sized memory is not yet implemented"
+                        // errors if including an if statement, so instead read the potentially-invalid
+                        // memory address and multiply it by 0 or 1 (if false, it's 0 ==> result is 0
+                        // as desired)
+                        const bool in_bounds = in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev;
+                        output[out_y*oo1 + out_x*oo2 + filter_y*oo3 + filter_x*oo4 + c] = in_bounds*x[in_y*xo2 + in_x*xo3 + c];
                     }
                 }
             }
@@ -433,7 +432,7 @@ class TFLiteOpenCL:
             // Store the result
             C[globalRow*N + globalCol] = fmin(fmax(acc + bias[globalCol], 0), 6);
         }
-        """).build(["-cl-finite-math-only", "-cl-unsafe-math-optimizations"])
+        """).build(["-cl-fast-relaxed-math"])
 
         # List of what to do
         self.operations = []
