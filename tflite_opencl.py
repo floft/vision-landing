@@ -9,7 +9,7 @@ correct results.
 Next step: optimize and test on the RPi Zero.
 
 Usage:
-    time PYOPENCL_CTX= ./tflite_opencl.py
+    time ./tflite_opencl.py
 
 How to use this "reference implementation" (a.k.a. a hacky script):
  - Running this will output tflite_opencl.npy
@@ -42,7 +42,7 @@ from image import find_files, load_image_into_numpy_array
 
 Padding = Enum("Padding", "VALID SAME")
 Activation = Enum("Activation", "NONE RELU6")
-Operation = Enum("Operation", "CONCAT RESHAPE LOGISTIC CONV2D DEPTHWISECONV2D POSTPROCESS")
+Operation = Enum("Operation", "CONCAT RESHAPE LOGISTIC CONV2D DEPTHWISECONV2D POSTPROCESS IM2COL MATMUL")
 
 def load_test_image(test_image_dir, width=300, height=300,
         input_mean=127.5, input_std=127.5, index=-1):
@@ -60,6 +60,8 @@ class TFLiteOpenCL:
         # Allow for interactive choice of which OpenCL device, otherwise pick
         # the first platform (on RPi probably only the one GPU unless pocl is
         # also installed)
+        #
+        # If interactive, you can specify with environment variable PYOPENCL_CTX=
         if interactive:
             self.ctx = cl.create_some_context()
         else:
@@ -343,6 +345,94 @@ class TFLiteOpenCL:
                 output[batch*oo1 + out_y*oo2 + out_x*oo3 + out_channel] = fmin(fmax(total + b[out_channel], 0), 6);
             }
         }
+
+        __kernel void im2col(
+            const int m, const int n_H, const int n_W, const int n_C,
+            const int stride, const int filter_dim,
+            const int pad_before_w, const int pad_before_h,
+            const int pad_after_w, const int pad_after_h,
+            const int n_H_prev, const int n_W_prev, const int n_C_prev,
+            __global const float* x,  __global float* output)
+        {
+            const int out_y = get_global_id(0);
+            const int out_x = get_global_id(1);
+            const int in_x_origin = out_x*stride - pad_before_w;
+            const int in_y_origin = out_y*stride - pad_before_h;
+
+            // x offsets
+            const int xo2 = n_W_prev*n_C_prev;
+            const int xo3 = n_C_prev;
+
+            // output offsets
+            const int oo1 = n_W*filter_dim*filter_dim*n_C_prev;
+            const int oo2 = filter_dim*filter_dim*n_C_prev;
+            const int oo3 = filter_dim*n_C_prev;
+            const int oo4 = n_C_prev;
+
+            // TODO move output to end, copy to local buf, then copy to output after
+            // the for loop
+
+            for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
+                for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
+                    const int in_x = in_x_origin + filter_x;
+                    const int in_y = in_y_origin + filter_y;
+
+                    for (int c = 0; c < n_C_prev; ++c) {
+                        float value = 0;
+
+                        if (in_x >= 0 && in_y >= 0 && in_x < n_W_prev && in_y < n_H_prev) {
+                            value = x[in_y*xo2 + in_x*xo3 + c];
+                        }
+
+                        output[out_y*oo1 + out_x*oo2 + filter_y*oo3 + filter_x*oo4 + c] = value;
+                    }
+                }
+            }
+        }
+
+        /*
+         * Based on: https://cnugteren.github.io/tutorial/pages/page4.html
+         */
+        // First naive implementation
+        __kernel void matmul(const int M, const int N, const int K,
+                            const __global float* A,
+                            const __global float* B,
+                            const __global float* bias,
+                            __global float* C) {
+
+            // Thread identifiers
+            const int globalRow = get_global_id(0); // Row ID of C (0..M)
+            const int globalCol = get_global_id(1); // Col ID of C (0..N)
+
+            // Compute a single element (loop over K)
+            float acc = 0.0f;
+            for (int k=0; k<K; ++k) {
+                acc += A[globalRow*K + k] * B[k*N + globalCol];
+            }
+
+            // Store the result
+            C[globalRow*N + globalCol] = acc + bias[globalCol];
+        }
+
+        __kernel void matmul_relu6(const int M, const int N, const int K,
+                            const __global float* A,
+                            const __global float* B,
+                            const __global float* bias,
+                            __global float* C) {
+
+            // Thread identifiers
+            const int globalRow = get_global_id(0); // Row ID of C (0..M)
+            const int globalCol = get_global_id(1); // Col ID of C (0..N)
+
+            // Compute a single element (loop over K)
+            float acc = 0.0f;
+            for (int k=0; k<K; ++k) {
+                acc += A[globalRow*K + k] * B[k*N + globalCol];
+            }
+
+            // Store the result
+            C[globalRow*N + globalCol] = fmin(fmax(acc + bias[globalCol], 0), 6);
+        }
         """).build(["-cl-finite-math-only", "-cl-unsafe-math-optimizations"])
 
         # List of what to do
@@ -453,30 +543,87 @@ class TFLiteOpenCL:
                 w_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=W)
                 b_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=b)
 
-                cl_ndrange = output_empty.shape[1:]
-                cl_args = (np.int32(m), np.int32(n_H), np.int32(n_W), np.int32(n_C),
-                    np.int32(stride), np.int32(f),
-                    np.int32(pad_before_w), np.int32(pad_before_h),
-                    np.int32(pad_after_w), np.int32(pad_after_h),
-                    np.int32(n_H_prev), np.int32(n_W_prev), np.int32(n_C_prev))
-                cl_weights = (w_buf, b_buf) # only used once, so create buffer here
-                cl_inputs = self.replace_buffers([input_tensors[0]["buffer"]])
-                cl_output = output_buffer
+                if op == Operation.CONV2D:
+                    out_im2col = np.empty((m,n_H*n_W,f*f*n_C_prev), dtype=options["out_type"])
+                    out_im2col_buf = cl.Buffer(self.ctx, mf.READ_WRITE, out_im2col.nbytes)
 
-                # Used multiple times, so allocate later
-                for i in cl_inputs:
-                    self.need_buffer.add(i)
-                self.need_buffer.add(cl_output)
+                    cl_ndrange = (n_H,n_W)
+                    cl_args = (np.int32(m), np.int32(n_H), np.int32(n_W), np.int32(n_C),
+                        np.int32(stride), np.int32(f),
+                        np.int32(pad_before_w), np.int32(pad_before_h),
+                        np.int32(pad_after_w), np.int32(pad_after_h),
+                        np.int32(n_H_prev), np.int32(n_W_prev), np.int32(n_C_prev))
+                    cl_inputs = self.replace_buffers([input_tensors[0]["buffer"]])
+                    cl_weights = (out_im2col_buf,) # actually an output...
+                    cl_output = None # output is in "weights" since init above
 
-                self.operations.append((
-                    op,
-                    activation,
-                    cl_ndrange,
-                    cl_args,
-                    cl_weights,
-                    cl_inputs,
-                    cl_output
-                ))
+                    # Used multiple times, so allocate later
+                    for i in cl_inputs:
+                        self.need_buffer.add(i)
+                    #self.need_buffer.add(cl_output)
+
+                    self.operations.append((
+                        Operation.IM2COL,
+                        None,
+                        cl_ndrange,
+                        cl_args,
+                        cl_weights,
+                        cl_inputs,
+                        cl_output
+                    ))
+
+                    M = n_H*n_W
+                    K = f*f*n_C_prev
+                    N = out_channels
+                    cl_ndrange = (M,N)
+                    cl_args = (np.int32(M), np.int32(N), np.int32(K))
+                    cl_inputs = () # input is in "weights" since we init above
+                    cl_weights = (out_im2col_buf, w_buf, b_buf) # only used once, so create buffer here
+                    cl_output = output_buffer
+
+                    # Used multiple times, so allocate later
+                    #for i in cl_inputs:
+                    #    self.need_buffer.add(i)
+                    self.need_buffer.add(cl_output)
+
+                    self.operations.append((
+                        Operation.MATMUL,
+                        activation,
+                        cl_ndrange,
+                        cl_args,
+                        cl_weights,
+                        cl_inputs,
+                        cl_output
+                    ))
+
+                #
+                # TODO also implement im2col for depthwise conv2d
+                #
+                else:
+                    cl_ndrange = output_empty.shape[1:]
+                    cl_args = (np.int32(m), np.int32(n_H), np.int32(n_W), np.int32(n_C),
+                        np.int32(stride), np.int32(f),
+                        np.int32(pad_before_w), np.int32(pad_before_h),
+                        np.int32(pad_after_w), np.int32(pad_after_h),
+                        np.int32(n_H_prev), np.int32(n_W_prev), np.int32(n_C_prev))
+                    cl_weights = (w_buf, b_buf) # only used once, so create buffer here
+                    cl_inputs = self.replace_buffers([input_tensors[0]["buffer"]])
+                    cl_output = output_buffer
+
+                    # Used multiple times, so allocate later
+                    for i in cl_inputs:
+                        self.need_buffer.add(i)
+                    self.need_buffer.add(cl_output)
+
+                    self.operations.append((
+                        op,
+                        activation,
+                        cl_ndrange,
+                        cl_args,
+                        cl_weights,
+                        cl_inputs,
+                        cl_output
+                    ))
             elif op == Operation.LOGISTIC:
                 assert len(input_buffers) == 1, "Logistic assumes single input"
                 x = input_buffers[0]
@@ -626,6 +773,13 @@ class TFLiteOpenCL:
 
         if cl_op == Operation.POSTPROCESS:
             return # Skip post process for now
+        elif cl_op == Operation.IM2COL:
+            f = self.prg.im2col
+        elif cl_op == Operation.MATMUL:
+            if cl_act == Activation.RELU6:
+                f = self.prg.matmul_relu6
+            else:
+                f = self.prg.matmul
         elif cl_op == Operation.CONV2D:
             if cl_act == Activation.RELU6:
                 f = self.prg.conv2d_relu6
@@ -645,11 +799,17 @@ class TFLiteOpenCL:
 
         inputs = tuple([self.opencl_bufs[i] for i in cl_inputs])
 
-        f(queue, cl_ndrange, None,
-                *cl_args,
-                *inputs,
-                *cl_weights,
-                self.opencl_bufs[cl_output])
+        if cl_output is None:
+            f(queue, cl_ndrange, None,
+                    *cl_args,
+                    *inputs,
+                    *cl_weights)
+        else:
+            f(queue, cl_ndrange, None,
+                    *cl_args,
+                    *inputs,
+                    *cl_weights,
+                    self.opencl_bufs[cl_output])
 
     def load_buf(self, queue, buf):
         """

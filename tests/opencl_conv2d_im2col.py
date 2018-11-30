@@ -360,7 +360,6 @@ def cl_im2col(x, W, b, stride, pad, out_type):
     prg.matmul(queue, (M, N), None,
         np.int32(M), np.int32(N), np.int32(K),
         out_im2col_buf, w_buf, b_buf, out_conv2d_buf)
-    # TODO add bias
     cl.enqueue_copy(queue, out_conv2d, out_conv2d_buf)
     t = time.time() - t
     print("compute time", t)
