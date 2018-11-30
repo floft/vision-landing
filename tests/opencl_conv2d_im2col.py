@@ -291,6 +291,9 @@ def cl_im2col(x, W, b, stride, pad, out_type):
         const int oo3 = filter_dim*n_C_prev;
         const int oo4 = n_C_prev;
 
+        // TODO move output to end, copy to local buf, then copy to output after
+        // the for loop
+
         for (int filter_y = 0; filter_y < filter_dim; ++filter_y) {
             for (int filter_x = 0; filter_x < filter_dim; ++filter_x) {
                 const int in_x = in_x_origin + filter_x;
@@ -310,58 +313,13 @@ def cl_im2col(x, W, b, stride, pad, out_type):
     }
 
     /*
-     * From: https://cnugteren.github.io/tutorial/pages/page4.html
-     *
-     * Tiled and coalesced version
+     * Based on: https://cnugteren.github.io/tutorial/pages/page4.html
      */
-    #define TS 32
-    __kernel void myGEMM2(const int M, const int N, const int K,
-                          const __global float* A,
-                          const __global float* B,
-                          __global float* C) {
-        // Thread identifiers
-        const int row = get_local_id(0); // Local row ID (max: TS)
-        const int col = get_local_id(1); // Local col ID (max: TS)
-        const int globalRow = TS*get_group_id(0) + row; // Row ID of C (0..M)
-        const int globalCol = TS*get_group_id(1) + col; // Col ID of C (0..N)
-
-        // Local memory to fit a tile of TS*TS elements of A and B
-        __local float Asub[TS][TS];
-        __local float Bsub[TS][TS];
-
-        // Initialise the accumulation register
-        float acc = 0.0f;
-
-        // Loop over all tiles
-        const int numTiles = K/TS;
-        for (int t=0; t<numTiles; t++) {
-
-            // Load one tile of A and B into local memory
-            const int tiledRow = TS*t + row;
-            const int tiledCol = TS*t + col;
-            Asub[col][row] = A[tiledCol*M + globalRow];
-            Bsub[col][row] = B[globalCol*K + tiledRow];
-
-            // Synchronise to make sure the tile is loaded
-            barrier(CLK_LOCAL_MEM_FENCE);
-
-            // Perform the computation for a single tile
-            for (int k=0; k<TS; k++) {
-                acc += Asub[k][row] * Bsub[col][k];
-            }
-
-            // Synchronise before loading the next tile
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-
-        // Store the final result in C
-        C[globalCol*M + globalRow] = acc;
-    }
-
     // First naive implementation
-    __kernel void myGEMM1(const int M, const int N, const int K,
+    __kernel void matmul(const int M, const int N, const int K,
                           const __global float* A,
                           const __global float* B,
+                          const __global float* bias,
                           __global float* C) {
 
         // Thread identifiers
@@ -369,15 +327,13 @@ def cl_im2col(x, W, b, stride, pad, out_type):
         const int globalCol = get_global_id(1); // Col ID of C (0..N)
 
         // Compute a single element (loop over K)
-        // TODO these indices may be wrong....
-        // also may not be right with multiple output channels
         float acc = 0.0f;
         for (int k=0; k<K; ++k) {
-            acc += A[globalRow*K + k] * B[globalCol*K + k];
+            acc += A[globalRow*K + k] * B[k*N + globalCol];
         }
 
         // Store the result
-        C[globalCol*M + globalRow] = acc;
+        C[globalRow*N + globalCol] = acc + bias[globalCol];
     }
     """).build()
 
@@ -387,9 +343,6 @@ def cl_im2col(x, W, b, stride, pad, out_type):
     b_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(b))
     out_im2col_buf = cl.Buffer(ctx, mf.READ_WRITE, out_im2col.nbytes)
     out_conv2d_buf = cl.Buffer(ctx, mf.WRITE_ONLY, out_conv2d.nbytes)
-
-    # TODO I think I could *not* do COPY_HOST_PTR for read/write buffers when
-    # I don't want them copied from the host
 
     t = time.time()
     prg.im2col(queue, (n_H,n_W), None,
@@ -401,16 +354,12 @@ def cl_im2col(x, W, b, stride, pad, out_type):
         x_buf, out_im2col_buf)
     #cl.enqueue_barrier(queue)
     cl.enqueue_copy(queue, out_im2col, out_im2col_buf) # For testing
-    #TS = 32
-    #WPT = 4
     M = n_H*n_W
     K = f*f*n_C_prev
     N = n_C
-    print((M,K,N))
-    #print((TS,TS), (M,N))
-    prg.myGEMM1(queue, (M, N), None,
+    prg.matmul(queue, (M, N), None,
         np.int32(M), np.int32(N), np.int32(K),
-        out_im2col_buf, w_buf, out_conv2d_buf)
+        out_im2col_buf, w_buf, b_buf, out_conv2d_buf)
     # TODO add bias
     cl.enqueue_copy(queue, out_conv2d, out_conv2d_buf)
     t = time.time() - t
@@ -454,6 +403,7 @@ if __name__ == "__main__":
     #     17, 4, 3, 27, 4, 3, 37, 4, 3]).reshape((2, 1, 3, 3))).all(), \
     #     "Test 1 gives "+str(result_cl)
 
+    # Single output channel
     data = np.array([
         1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8
     ]).reshape((1,2,4,2)).astype(np.float32)
@@ -464,7 +414,28 @@ if __name__ == "__main__":
     stride = 1
 
     t_im2col_gpu = time.time()
-    result_im2colgpu = cl_im2col(data, weights, bias, stride, Padding.VALID, np.float32)
+    result_im2colgpu = cl_im2col(data, weights, bias, stride, Padding.SAME, np.float32)
     t_im2col_gpu = time.time() - t_im2col_gpu
-    print("im2col gpu", t_im2col_gpu)
-    print(result_im2colgpu)
+    print("im2col gpu test 1", t_im2col_gpu)
+    assert (result_im2colgpu[1] == np.array([
+         88, 108, 128, 56, 34, 40, 46, 16]).reshape((1, 2, 4, 1))).all(), \
+         "im2col gpu test 1 gives "+str(result_im2colgpu)
+
+    # Two output channels
+    data = np.array([
+        1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8
+    ]).reshape((1,2,4,2)).astype(np.float32)
+    weights = np.array([
+        1, -1, -1, 1, 2, -2, -2, 2, 3, -3, -3, 3, 4, -4, -4, 4
+    ]).reshape((2,2,2,2)).astype(np.float32)
+    bias = np.array([0,1]).astype(np.float32)
+    stride = 1
+
+    t_im2col_gpu = time.time()
+    result_im2colgpu = cl_im2col(data, weights, bias, stride, Padding.SAME, np.float32)
+    t_im2col_gpu = time.time() - t_im2col_gpu
+    print("im2col gpu test 2", t_im2col_gpu)
+    assert (result_im2colgpu[1] == np.array([
+         88, -88+1, 108, -108+1, 128, -128+1, 56, -56+1,
+         34, -34+1, 40, -40+1, 46, -46+1, 16, -16+1]).reshape((1, 2, 4, 2))).all(), \
+         "im2col gpu test 2 gives "+str(result_im2colgpu)

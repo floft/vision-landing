@@ -618,8 +618,6 @@ class TFLiteOpenCL:
         self.opencl_bufs = {} # Indexed by buffer ID
 
         for buf in self.need_buffer:
-            #cl_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR,
-            #    self.bufs[buf].nbytes, hostbuf=self.bufs[buf])
             cl_buf = cl.Buffer(self.ctx, mf.READ_WRITE, self.bufs[buf].nbytes)
             self.opencl_bufs[buf] = cl_buf
 
