@@ -10,9 +10,9 @@ https://leonardoaraujosantos.gitbooks.io/artificial-inteligence/content/making_f
 import time
 import numpy as np
 import pyopencl as cl
-#import tensorflow as tf
+import tensorflow as tf
 from enum import Enum
-#tf.enable_eager_execution()
+tf.enable_eager_execution()
 
 Padding = Enum("Padding", "VALID SAME")
 
@@ -368,40 +368,56 @@ def cl_im2col(x, W, b, stride, pad, out_type):
     return out_im2col, out_conv2d
 
 if __name__ == "__main__":
-    # data = np.array([
-    #     1, 1, 1, 1, 2, 2, 2, 2,
-    #     1, 2, 3, 4, 1, 2, 3, 4,
-    # ]).reshape((2, 2, 4, 1)).astype(np.float32)
-    # weights = np.array([
-    #     1, 2, 3, 4,
-    #     -1, 1, -1, 1,
-    #     -1, -1, 1, 1
-    # ]).reshape((3, 2, 2, 1)).transpose((1,2,3,0)).astype(np.float32)
-    # bias = np.array([1, 2, 3]).astype(np.float32)
-    # stride = 1
+    data = np.array([
+        1, 1, 1, 1, 2, 2, 2, 2,
+        1, 2, 3, 4, 1, 2, 3, 4,
+    ]).reshape((2, 2, 4, 1)).astype(np.float32)
+    weights = np.array([
+        1, 2, 3, 4,
+        -1, 1, -1, 1,
+        -1, -1, 1, 1
+    ]).reshape((3, 2, 2, 1)).transpose((1,2,3,0)).astype(np.float32)
+    bias = np.array([1, 2, 3]).astype(np.float32)
+    stride = 1
 
-    # t_tf = time.time()
-    # result_tf = conv2d_tf(data, weights, bias, stride, Padding.VALID, np.float32)
-    # t_tf = time.time() - t_tf
-    # print("TF", t_tf)
-    # print(result_tf)
+    t_tf = time.time()
+    result_tf = conv2d_tf(data, weights, bias, stride, Padding.VALID, np.float32)
+    t_tf = time.time() - t_tf
+    print("TF", t_tf)
+    print(result_tf)
 
-    # t_cl = time.time()
-    # result_cl = conv2d_mine(data, weights, bias, stride, Padding.VALID, np.float32)
-    # t_cl = time.time() - t_cl
-    # print("Mine", t_cl)
-    # print(result_cl)
+    t_cl = time.time()
+    result_cl = conv2d_mine(data, weights, bias, stride, Padding.VALID, np.float32)
+    t_cl = time.time() - t_cl
+    print("Mine", t_cl)
+    print(result_cl)
 
-    # t_im2col_cpu = time.time()
-    # result_im2colcpu = conv2d_im2col_cpu(data, weights, bias, stride, Padding.VALID, np.float32)
-    # t_im2col_cpu = time.time() - t_im2col_cpu
-    # print("im2col cpu", t_im2col_cpu)
-    # print(result_im2colcpu)
+    assert (result_cl == np.array([
+        18, 2, 5, 18, 2, 5, 18, 2, 5,
+        17, 4, 3, 27, 4, 3, 37, 4, 3]).reshape((2, 1, 3, 3))).all(), \
+        "Test 1 gives "+str(result_cl)
 
-    # assert (result_cl == np.array([
+    t_im2col_cpu = time.time()
+    result_im2colcpu = conv2d_im2col_cpu(data, weights, bias, stride, Padding.VALID, np.float32)
+    t_im2col_cpu = time.time() - t_im2col_cpu
+    print("im2col cpu", t_im2col_cpu)
+    print(result_im2colcpu)
+
+    assert (result_im2colcpu == np.array([
+        18, 2, 5, 18, 2, 5, 18, 2, 5,
+        17, 4, 3, 27, 4, 3, 37, 4, 3]).reshape((2, 1, 3, 3))).all(), \
+        "Test 1 gives "+str(result_im2colcpu)
+
+    # t_im2col_gpu = time.time()
+    # result_im2colgpu = cl_im2col(data, weights, bias, stride, Padding.VALID, np.float32)
+    # t_im2col_gpu = time.time() - t_im2col_gpu
+    # print("im2col gpu", t_im2col_gpu)
+    # print(result_im2colgpu)
+
+    # assert (result_im2colgpu == np.array([
     #     18, 2, 5, 18, 2, 5, 18, 2, 5,
     #     17, 4, 3, 27, 4, 3, 37, 4, 3]).reshape((2, 1, 3, 3))).all(), \
-    #     "Test 1 gives "+str(result_cl)
+    #     "Test 1 gives "+str(result_im2colgpu)
 
     # Single output channel
     data = np.array([
