@@ -1,0 +1,13 @@
+[Unit]
+Description=MAVProxy
+
+[Service]
+ExecStart=/usr/local/bin/mavproxy.py --master=/dev/ttyAMA0,115200 --out=udpin:0.0.0.0:14550 --out=tcpin:0.0.0.0:14551 --daemon --logfile=/home/pi/mav.tlog
+Restart=always
+RestartSec=15
+User=pi
+Group=users
+SupplementaryGroups=dialout video
+
+[Install]
+WantedBy=multi-user.target
