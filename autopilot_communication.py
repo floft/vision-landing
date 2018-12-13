@@ -11,13 +11,13 @@ from pymavlink import mavutil, mavwp, mavparm
 
 class AutopilotCommuncation:
     def __init__(self, device="/dev/ttyAMA0", baudrate=115200, source_system=255,
-            channel=6, autoreconnect=True, cutoffs=[1282, 1716], rate=2,
+            channels=[6], autoreconnect=True, cutoffs=[1282, 1716], rate=2,
             on_mode=None):
         """
         Device: e.g. /dev/ttyAMA0
         Baudrate: e.g. 115200
         Source_system: probably 255
-        Channel: e.g. 6 for aux 6 (set via your RC controller)
+        Channels: e.g. [6] for aux 6 (set via your RC controller)
         Autoreconnect: passed to MAVLink connection
         Cutoffs: my switch 6 goes between 1065, 1499, and 1933, and the defaults
             are between those
@@ -27,10 +27,10 @@ class AutopilotCommuncation:
         print("Connecting to", device, "at", baudrate, "set to id", source_system)
         self.master = mavutil.mavlink_connection(device, baudrate, source_system,
             autoreconnect=autoreconnect)
-        self.channel = channel
+        self.channels = channels
         self.cutoffs = cutoffs
         self.exiting = False
-        self.mode = None
+        self.modes = {c: None for c in self.channels}
         self.rate = rate
         self.on_mode = on_mode
 
@@ -54,22 +54,23 @@ class AutopilotCommuncation:
             msg_data = msg.to_dict()
 
             if msg_type == "RC_CHANNELS_RAW":
-                val = msg_data["chan"+str(self.channel)+"_raw"]
+                for c in self.channels:
+                    val = msg_data["chan"+str(c)+"_raw"]
 
-                if val < self.cutoffs[0]:
-                    self.set_mode(0)
-                elif val < self.cutoffs[1]:
-                    self.set_mode(1)
-                else:
-                    self.set_mode(2)
+                    if val < self.cutoffs[0]:
+                        self.set_mode(c, 0)
+                    elif val < self.cutoffs[1]:
+                        self.set_mode(c, 1)
+                    else:
+                        self.set_mode(c, 2)
 
-    def set_mode(self, mode):
-        if self.mode != mode:
-            print("Changing to mode", mode)
-            self.mode = mode
+    def set_mode(self, channel, mode):
+        if self.modes[channel] != mode:
+            print("Changing channel", channel, "to mode", mode)
+            self.modes[channel] = mode
 
             if self.on_mode is not None:
-                self.on_mode(mode)
+                self.on_mode(channel, mode)
 
     def exit(self):
         self.exiting = True
@@ -87,7 +88,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ap = AutopilotCommuncation(args.device, args.baudrate, args.source_system,
-        args.aux_channel)
+        [args.aux_channel])
 
     try:
         ap.run()

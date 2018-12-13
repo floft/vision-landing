@@ -2,7 +2,7 @@
 Description=Stream RTSP Video
 
 [Service]
-ExecStart=/usr/local/bin/v4l2rtspserver -F10 -H720 -W1280 -P8555 /dev/video0
+ExecStart=/usr/local/bin/v4l2rtspserver -F15 -H720 -W1280 -P8555 /dev/video0
 Restart=always
 RestartSec=5
 User=pi

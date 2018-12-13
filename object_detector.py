@@ -34,6 +34,7 @@ gi.require_version('GLib', '2.0')
 gi.require_version('GObject', '2.0')
 from gi.repository import GLib, GObject, Gst
 
+from filesystem import latest_index, get_record_dir
 from image import find_files, load_image_into_numpy_array
 
 try:
@@ -41,32 +42,6 @@ try:
     from picamera.array import PiRGBArray
 except ImportError:
     print("Warning: cannot import picamera, live mode won't work")
-
-def latest_index(dir_name, glob="*", folders=False):
-    """
-    Looks in dir_name at all files matching glob and returns highest number.
-
-    For folders (folders=True): you can leave glob="*"
-    For files (folders=False): probably should specify something like glob="*.jpg"
-    """
-    # Get list of files/folders
-    files = pathlib.Path(dir_name).glob(glob)
-
-    # Get number from filenames or folders
-    regex = re.compile(r'\d+')
-    numbers = []
-
-    for f in files:
-        if not folders or os.path.isdir(f):
-            f_numbers = [int(x) for x in regex.findall(str(f.name))]
-            assert len(f_numbers) == 1, "Should only be 1 number in file/folder"
-            numbers.append(f_numbers[0])
-
-    # If there is a highest number, get it. Otherwise, start at zero.
-    if len(numbers) > 0:
-        return sorted(numbers)[-1] # Highest number
-    else:
-        return 0
 
 def load_labels(filename):
     """
@@ -659,23 +634,9 @@ if __name__ == "__main__":
     assert args.remote + args.live + args.offline == 1, \
         "Must specify exactly one of --remote, --live, or --offline"
 
-    # Directory for recording, e.g. if "record" and there are directories
-    # record/00000 and record/00001, then we'll start next at record record/00002
     record_dir = ""
-
     if args.record != "":
-        # Find previous index
-        record_index = latest_index(args.record, folders=True)
-        # If no images in that directory, use it. If images, increment
-        record_dir_prev = os.path.join(args.record, "%05d"%record_index)
-        img_index = latest_index(record_dir_prev, "*.jpg")
-
-        if img_index == 0:
-            record_dir = record_dir_prev
-        else:
-            record_index += 1
-            record_dir = os.path.join(args.record, "%05d"%record_index)
-
+        record_dir = get_record_dir(args.record)
         print("Recording to:", record_dir)
 
     # Run detection

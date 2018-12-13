@@ -8,4 +8,5 @@ rsync -Pahuv \
     --exclude="exported_models*" \
     --exclude="__pycache__" \
     --exclude="*.npy*" \
+    --exclude="capture" \
     ./ rpiz:vision-landing/

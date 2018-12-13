@@ -17,7 +17,7 @@ class ControlStreaming:
         # Create objects to communicate with autopilot and stream video
         self.ap = AutopilotCommuncation(
             device, baudrate, source_system,
-            aux_channel, on_mode=lambda mode: self.on_mode(mode))
+            [aux_channel], on_mode=lambda c, m: self.on_mode(c, m))
         self.s = LiveStream(port)
 
         # Which mode we should record in
@@ -48,7 +48,7 @@ class ControlStreaming:
         self.s.exiting = False # Reset
         self.t_vid.start()
 
-    def on_mode(self, mode):
+    def on_mode(self, channel, mode):
         if mode == self.enabled_mode:
             # Only start streaming if not already running
             if self.t_vid is None or not self.t_vid.is_alive():
