@@ -431,10 +431,8 @@ class ObjectDetectorBase:
 
         try:
             self.loop.run()
-        except:
-            pass
-
-        self.pipe.set_state(Gst.State.NULL)
+        finally:
+            self.pipe.set_state(Gst.State.NULL)
 
     def gst_start(self):
         """ If using GStreamer, start that thread """
@@ -541,6 +539,7 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
         self.img_index = 1
 
         Gst.init(None)
+        self.t_remote_gst = threading.Thread(target=self.remote_gst_run)
 
         # uridecodebin -> appsink
         self.remote_pipe = Gst.parse_launch("uridecodebin " \
@@ -576,13 +575,17 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
                 self.img_index = latest_index(self.record, "*.jpg")+1
 
         self.gst_start()
+        self.remote_gst_start()
 
-        try:
-            self.remote_gst_run()
-        except KeyboardInterrupt:
-            self.exiting = True
-            self.remote_loop.quit()
-            self.gst_stop()
+        # We'll sleep in this thread and run GStreamer in a separate thread
+        # since if we call remote_gst_run() here, it'll never exit on a Ctrl+C
+        while not self.exiting:
+            try:
+                time.sleep(5)
+            except KeyboardInterrupt:
+                self.exiting = True
+                self.remote_gst_stop()
+                self.gst_stop()
 
     def remote_process_frame(self, appsink):
         # Get frame
@@ -629,10 +632,15 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
 
         try:
             self.remote_loop.run()
-        except:
-            pass
+        finally:
+            self.remote_pipe.set_state(Gst.State.NULL)
 
-        self.remote_pipe.set_state(Gst.State.NULL)
+    def remote_gst_start(self):
+        self.t_remote_gst.start()
+
+    def remote_gst_stop(self):
+        self.remote_loop.quit()
+        self.t_remote_gst.join()
 
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
