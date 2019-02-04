@@ -712,15 +712,15 @@ if __name__ == "__main__":
 
     parser.add_argument("--images", default="test_images", type=str,
         help="If offline, directory of test .jpg images (default test_images/)")
-    parser.add_argument("--host", default="rpi-zero", type=str,
-        help="Hostname to connect to if in remote mode (default rpi-zero)")
-    parser.add_argument("--port", default=5555, type=int,
-        help="Port to connect to if in remote mode (default 5555)")
+    parser.add_argument("--host", default="192.168.4.1", type=str,
+        help="Hostname to connect to if in remote mode (default 192.168.4.1)")
+    parser.add_argument("--port", default=8555, type=int,
+        help="Port to connect to if in remote mode (default 8555)")
 
     parser.add_argument("--remote-udp", dest='remote_udp', action='store_true',
-        help="Run detection on remote streamed video over UDP")
+        help="Run detection on remote streamed video over UDP (default)")
     parser.add_argument("--no-remote-udp", dest='remote_udp', action='store_false',
-        help="Do not run detection on remote streamed video over UDP (default)")
+        help="Do not run detection on remote streamed video over UDP")
 
     parser.add_argument("--remote", dest='remote', action='store_true',
         help="Run detection on remote streamed video")
@@ -743,9 +743,9 @@ if __name__ == "__main__":
         help="Do not show image with detection results (default)")
 
     parser.add_argument("--gst", dest='gst', action='store_true',
-        help="Show streamed images with GStreamer")
+        help="Show streamed images with GStreamer (default)")
     parser.add_argument("--no-gst", dest='gst', action='store_false',
-        help="Do not show streamed images with GStreamer (default)")
+        help="Do not show streamed images with GStreamer")
 
     parser.add_argument("--lite", dest='lite', action='store_true',
         help="Use TF Lite (default)")
@@ -761,8 +761,8 @@ if __name__ == "__main__":
         help="Do not output debug information ")
 
     parser.set_defaults(
-        remote=False, remote_udp=False, live=False, offline=False,
-        lite=True, show=False, debug=False)
+        remote=False, remote_udp=True, live=False, offline=False,
+        lite=True, show=False, gst=True, debug=True)
     args = parser.parse_args()
 
     assert args.remote + args.remote_udp + args.live + args.offline == 1, \
