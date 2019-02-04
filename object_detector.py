@@ -505,6 +505,98 @@ class RemoteObjectDetector(ObjectDetectorBase):
                 self.exiting = True
                 self.gst_stop()
 
+class RemoteObjectDetectorUdp(ObjectDetectorBase):
+    """
+    Run object detection on images streamed from a remote camera over UDP,
+    also supports displaying live stream via GStreamer
+    """
+    def __init__(self, host, port, record, *args, **kwargs):
+        # Defines pipe, loop, etc.
+        super().__init__(*args, **kwargs)
+
+        # Needed when processing frames in GStreamer
+        self.record = record
+        self.img_index = 1
+
+        # Setup if not already
+        if not self.gst:
+            Gst.init(None)
+            self.pipe = Gst.Pipeline.new("object-detection")
+
+        # uridecodebin -> appsink
+        uridecodebin = Gst.ElementFactory.make("uridecodebin")
+        #self.remote_sink = Gst.ElementFactory.make("appsink")
+        self.remote_sink = Gst.ElementFactory.make("autovideosink")
+
+        # Stream
+        #rtspsrc.set_property("location", "rtsp://"+host+":"+str(port)+"/unicast")
+        #rtspsrc.set_property("latency", 0)
+        uridecodebin.set_property("uri", "rtsp://"+host+":"+str(port)+"/unicast")
+
+        # Process new frames
+        #self.remote_sink.set_property("sync", False)
+        #self.remote_sink.set_property("drop", True)
+        #self.remote_sink.set_property("emit-signals", True)
+        #self.remote_sink.connect("new-sample", lambda x: self.remote_process_frame(x))
+
+        # Add to pipeline and connect
+        self.pipe.add(uridecodebin, self.remote_sink)
+        uridecodebin.link(self.remote_sink)
+
+        # Setup if not already
+        if not self.gst:
+            # Event loop
+            self.loop = GLib.MainLoop()
+
+            # Get error messages or end of stream on bus
+            bus = self.pipe.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self.gst_bus_call, self.loop)
+
+    def run(self):
+        # Don't overwrite previous images if there are any
+        if self.record != "":
+            if not os.path.exists(self.record):
+                os.makedirs(self.record)
+                self.img_index = 1
+            else:
+                self.img_index = latest_index(self.record, "*.jpg")+1
+
+        try:
+            self.gst_run()
+        except KeyboardInterrupt:
+            self.exiting = True
+
+            if self.gst:
+                self.gst_stop()
+            else:
+                self.loop.quit()
+
+    def remote_process_frame(self, appsink):
+        # Get frame
+        frame = appsink.emit("pull-sample")
+        print("Got sample")
+        return
+
+        detections = self.process(frame, frame.shape[1], frame.shape[0])
+
+        if self.record != "":
+            filename = os.path.join(self.record, "%05d.jpg"%self.img_index)
+            Image.fromarray(frame).save(filename)
+            self.img_index += 1
+            print("Saved", filename)
+
+        if self.debug:
+            for i, d in enumerate(detections):
+                print("Result "+str(i)+":", d)
+
+        # We do this last since low_level_detection_show modifies
+        # the image
+        self.gst_next_detection(frame, detections)
+
+        # TODO needed?
+        return False
+
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
     def __init__(self, *args, **kwargs):
@@ -576,8 +668,8 @@ class OfflineObjectDetector(ObjectDetectorBase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="detect_quantized.tflite", type=str,
-        help="Model file (if TF lite) or directory (if graph) (default detect_quantized.tflite)")
+    parser.add_argument("--model", default="detect_float_v2.tflite", type=str,
+        help="Model file (if TF lite) or directory (if graph) (default detect_float_v2.tflite)")
     parser.add_argument("--labels", default="labels.txt", type=str,
         help="Label file (one per line) (default labels.txt")
 
@@ -587,6 +679,11 @@ if __name__ == "__main__":
         help="Hostname to connect to if in remote mode (default rpi-zero)")
     parser.add_argument("--port", default=5555, type=int,
         help="Port to connect to if in remote mode (default 5555)")
+
+    parser.add_argument("--remote-udp", dest='remote_udp', action='store_true',
+        help="Run detection on remote streamed video over UDP")
+    parser.add_argument("--no-remote-udp", dest='remote_udp', action='store_false',
+        help="Do not run detection on remote streamed video over UDP (default)")
 
     parser.add_argument("--remote", dest='remote', action='store_true',
         help="Run detection on remote streamed video")
@@ -627,12 +724,12 @@ if __name__ == "__main__":
         help="Do not output debug information ")
 
     parser.set_defaults(
-        remote=False, live=False, offline=False,
+        remote=False, remote_udp=False, live=False, offline=False,
         lite=True, show=False, debug=False)
     args = parser.parse_args()
 
-    assert args.remote + args.live + args.offline == 1, \
-        "Must specify exactly one of --remote, --live, or --offline"
+    assert args.remote + args.remote_udp + args.live + args.offline == 1, \
+        "Must specify exactly one of --remote, --remote-udp --live, or --offline"
 
     record_dir = ""
     if args.record != "":
@@ -644,6 +741,11 @@ if __name__ == "__main__":
         with RemoteObjectDetector(args.model, args.labels,
                 debug=args.debug, lite=args.lite, gst=args.gst) as d:
             d.run(args.host, args.port, show_image=args.show, record=record_dir)
+    elif args.remote_udp:
+        with RemoteObjectDetectorUdp(args.host, args.port, record_dir,
+                args.model, args.labels,
+                debug=args.debug, lite=args.lite, gst=args.gst) as d:
+            d.run()
     elif args.live:
         with LiveObjectDetector(args.model, args.labels,
                 debug=args.debug, lite=args.lite, gst=args.gst) as d:
