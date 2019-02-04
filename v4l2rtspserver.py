@@ -50,7 +50,7 @@ class V4L2RTSPServer:
             print("Executing", cmd)
             self.p_capture = subprocess.Popen(cmd)
         else:
-            cmd = [self.prog, "-W%d"%width, "-H%d"%height, "-F%d"%fps,
+            cmd = [self.prog, "-M224.0.0.1:20000", "-W%d"%width, "-H%d"%height, "-F%d"%fps,
                 "-P%d"%self.port, self.device]
             print("Executing", cmd)
             self.p_rtsp = subprocess.Popen(cmd)
