@@ -299,7 +299,8 @@ class ObjectDetectorBase:
     """ Wrap detector to calculate FPS """
     def __init__(self, model_file, labels_path, min_score=0.5,
             average_fps_frames=30, debug=False, lite=True,
-            gst=False, gst_width=300, gst_height=300, gst_framerate=15):
+            gst=False, gst_width=300, gst_height=300, gst_framerate=15,
+            gst_already_setup=False):
         self.debug = debug
         self.lite = lite
         self.gst = gst
@@ -322,10 +323,12 @@ class ObjectDetectorBase:
         if self.gst:
             self.t_gst = threading.Thread(target=self.gst_run)
 
-            Gst.init(None)
+            if not gst_already_setup:
+                Gst.init(None)
+
+            self.pipe = Gst.Pipeline.new("object-detection")
 
             # appsrc -> videoconvert (since data is RGB) -> autovideosink
-            self.pipe = Gst.Pipeline.new("object-detection")
             self.src = Gst.ElementFactory.make("appsrc")
             convert = Gst.ElementFactory.make("videoconvert")
             sink = Gst.ElementFactory.make("autovideosink")
@@ -505,53 +508,63 @@ class RemoteObjectDetector(ObjectDetectorBase):
                 self.exiting = True
                 self.gst_stop()
 
+def get_buffer_size(caps):
+    """
+    Returns width, height of buffer from caps
+    Taken from: http://lifestyletransfer.com/how-to-get-buffer-width-height-from-gstreamer-caps/
+
+    :param caps: https://lazka.github.io/pgi-docs/Gst-1.0/classes/Caps.html
+    :type caps: Gst.Caps
+
+    :rtype: bool, (int, int)
+    """
+    caps_struct = caps.get_structure(0)
+
+    (success, width) = caps_struct.get_int('width')
+    if not success:
+        return False, (0, 0)
+
+    (success, height) = caps_struct.get_int('height')
+    if not success:
+        return False, (0, 0)
+
+    return True, (width, height)
+
 class RemoteObjectDetectorUdp(ObjectDetectorBase):
     """
     Run object detection on images streamed from a remote camera over UDP,
     also supports displaying live stream via GStreamer
     """
     def __init__(self, host, port, record, *args, **kwargs):
-        # Defines pipe, loop, etc.
-        super().__init__(*args, **kwargs)
-
         # Needed when processing frames in GStreamer
         self.record = record
         self.img_index = 1
 
-        # Setup if not already
-        if not self.gst:
-            Gst.init(None)
-            self.pipe = Gst.Pipeline.new("object-detection")
+        Gst.init(None)
 
         # uridecodebin -> appsink
-        uridecodebin = Gst.ElementFactory.make("uridecodebin")
-        #self.remote_sink = Gst.ElementFactory.make("appsink")
-        self.remote_sink = Gst.ElementFactory.make("autovideosink")
-
-        # Stream
-        #rtspsrc.set_property("location", "rtsp://"+host+":"+str(port)+"/unicast")
-        #rtspsrc.set_property("latency", 0)
-        uridecodebin.set_property("uri", "rtsp://"+host+":"+str(port)+"/unicast")
+        self.remote_pipe = Gst.parse_launch("uridecodebin " \
+            + "uri=rtsp://"+host+":"+str(port)+"/unicast source::latency=0 " \
+            + "! videoconvert ! video/x-raw,format=RGB " \
+            + "! appsink name=appsink")
+        remote_sink = self.remote_pipe.get_by_name("appsink")
 
         # Process new frames
-        #self.remote_sink.set_property("sync", False)
-        #self.remote_sink.set_property("drop", True)
-        #self.remote_sink.set_property("emit-signals", True)
-        #self.remote_sink.connect("new-sample", lambda x: self.remote_process_frame(x))
+        remote_sink.set_property("sync", False)
+        remote_sink.set_property("drop", True)
+        remote_sink.set_property("emit-signals", True)
+        remote_sink.connect("new-sample", lambda x: self.remote_process_frame(x))
 
-        # Add to pipeline and connect
-        self.pipe.add(uridecodebin, self.remote_sink)
-        uridecodebin.link(self.remote_sink)
+        # Event loop
+        self.remote_loop = GLib.MainLoop()
 
-        # Setup if not already
-        if not self.gst:
-            # Event loop
-            self.loop = GLib.MainLoop()
+        # Get error messages or end of stream on bus
+        bus = self.remote_pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.gst_bus_call, self.remote_loop)
 
-            # Get error messages or end of stream on bus
-            bus = self.pipe.get_bus()
-            bus.add_signal_watch()
-            bus.connect("message", self.gst_bus_call, self.loop)
+        # Make sure we don't reinit GStreamer
+        super().__init__(*args, **kwargs, gst_already_setup=True)
 
     def run(self):
         # Don't overwrite previous images if there are any
@@ -562,40 +575,64 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
             else:
                 self.img_index = latest_index(self.record, "*.jpg")+1
 
+        self.gst_start()
+
         try:
-            self.gst_run()
+            self.remote_gst_run()
         except KeyboardInterrupt:
             self.exiting = True
-
-            if self.gst:
-                self.gst_stop()
-            else:
-                self.loop.quit()
+            self.remote_loop.quit()
+            self.gst_stop()
 
     def remote_process_frame(self, appsink):
         # Get frame
-        frame = appsink.emit("pull-sample")
-        print("Got sample")
-        return
+        sample = appsink.emit("pull-sample")
+        got_caps, (width, height) = get_buffer_size(sample.get_caps())
 
-        detections = self.process(frame, frame.shape[1], frame.shape[0])
+        assert got_caps, \
+            "Could not get width/height from buffer!"
 
-        if self.record != "":
-            filename = os.path.join(self.record, "%05d.jpg"%self.img_index)
-            Image.fromarray(frame).save(filename)
-            self.img_index += 1
-            print("Saved", filename)
+        # See: https://github.com/TheImagingSource/tiscamera/blob/master/examples/python/opencv.py
+        buf = sample.get_buffer()
 
-        if self.debug:
-            for i, d in enumerate(detections):
-                print("Result "+str(i)+":", d)
+        try:
+            _, mapinfo = buf.map(Gst.MapFlags.READ)
+            # Create a numpy array from the data
+            frame = np.asarray(bytearray(mapinfo.data), dtype=np.uint8)
+            # Give the array the correct dimensions of the video image
+            # Note: 3 channels: R, G, B
+            frame = frame.reshape((height, width, 3))
 
-        # We do this last since low_level_detection_show modifies
-        # the image
-        self.gst_next_detection(frame, detections)
+            detections = self.process(frame, width, height)
 
-        # TODO needed?
+            if self.record != "":
+                filename = os.path.join(self.record, "%05d.jpg"%self.img_index)
+                Image.fromarray(frame).save(filename)
+                self.img_index += 1
+                print("Saved", filename)
+
+            if self.debug:
+                for i, d in enumerate(detections):
+                    print("Result "+str(i)+":", d)
+
+            # We do this last since low_level_detection_show modifies
+            # the image
+            self.gst_next_detection(frame, detections)
+        finally:
+            buf.unmap(mapinfo)
+
         return False
+
+    def remote_gst_run(self):
+        """ This is run in a separate thread. Start, loop, and cleanup. """
+        self.remote_pipe.set_state(Gst.State.PLAYING)
+
+        try:
+            self.remote_loop.run()
+        except:
+            pass
+
+        self.remote_pipe.set_state(Gst.State.NULL)
 
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
