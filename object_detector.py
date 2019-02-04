@@ -534,18 +534,27 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
     also supports displaying live stream via GStreamer
     """
     def __init__(self, host, port, record, *args, **kwargs):
-        # Needed when processing frames in GStreamer
         self.record = record
+        self.host = host
+        self.port = port
         self.img_index = 1
 
         Gst.init(None)
-        self.t_remote_gst = threading.Thread(target=self.remote_gst_run)
+        self.t_remote_gst = None
+        self.t_restart = None
 
+        self.setup_gst()
+
+        # Make sure we don't reinit GStreamer
+        super().__init__(*args, **kwargs, gst_already_setup=True)
+
+    def setup_gst(self):
         # uridecodebin -> appsink
         self.remote_pipe = Gst.parse_launch("uridecodebin " \
-            + "uri=rtsp://"+host+":"+str(port)+"/unicast source::latency=0 " \
+            + "uri=rtsp://"+self.host+":"+str(self.port)+"/unicast source::latency=0 " \
             + "! videoconvert ! video/x-raw,format=RGB " \
             + "! appsink name=appsink")
+
         remote_sink = self.remote_pipe.get_by_name("appsink")
 
         # Process new frames
@@ -560,10 +569,7 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
         # Get error messages or end of stream on bus
         bus = self.remote_pipe.get_bus()
         bus.add_signal_watch()
-        bus.connect("message", self.gst_bus_call, self.remote_loop)
-
-        # Make sure we don't reinit GStreamer
-        super().__init__(*args, **kwargs, gst_already_setup=True)
+        bus.connect("message", self.remote_gst_bus_call, self.remote_loop)
 
     def run(self):
         # Don't overwrite previous images if there are any
@@ -586,6 +592,10 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
                 self.exiting = True
                 self.remote_gst_stop()
                 self.gst_stop()
+
+                # Make sure we get rid of the restart thread
+                if self.t_restart is not None and self.t_restart.is_alive():
+                    self.t_restart.join()
 
     def remote_process_frame(self, appsink):
         # Get frame
@@ -636,11 +646,59 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
             self.remote_pipe.set_state(Gst.State.NULL)
 
     def remote_gst_start(self):
-        self.t_remote_gst.start()
+        if self.t_remote_gst is None:
+            self.t_remote_gst = threading.Thread(target=self.remote_gst_run)
+            self.t_remote_gst.start()
 
     def remote_gst_stop(self):
-        self.remote_loop.quit()
-        self.t_remote_gst.join()
+        if self.t_remote_gst is not None:
+            self.remote_loop.quit()
+            self.t_remote_gst.join()
+            self.t_remote_gst = None
+
+    def remote_gst_bus_call(self, bus, message, loop):
+        """ Print important messages """
+        t = message.type
+        retry = False
+        if t == Gst.MessageType.EOS:
+            print("End-of-stream")
+            #loop.quit()
+            retry = True
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print("Error: %s: %s" % (err, debug))
+            #loop.quit()
+            retry = True
+        #elif t == Gst.MessageType.STATE_CHANGED:
+        #    old, new, pending = message.parse_state_changed()
+        #    print("Changing from", old, "to", new)
+
+        # Wait a bit, then we'll try again rather than exiting
+        # since the stream isn't always running
+        if retry:
+            if self.t_restart is None or not self.t_restart.is_alive():
+                self.t_restart = threading.Thread(target=self.restart_run)
+                self.t_restart.start()
+
+        return True
+
+    def restart_run(self):
+        """
+        Need to restart from different thread:
+        http://gstreamer-devel.966125.n4.nabble.com/Correct-way-to-reconnect-to-a-network-stream-td4197164.html
+        """
+        if not self.exiting:
+            # Stop streaming part
+            self.remote_pipe.set_state(Gst.State.NULL)
+            self.remote_gst_stop()
+
+            time.sleep(1)
+
+            # Recreate
+            self.setup_gst()
+
+            # Start again
+            self.remote_gst_start()
 
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
