@@ -23,7 +23,9 @@ class V4L2RTSPServer:
 
         # Put files in this directory
         self.path = path
-        os.makedirs(path, exist_ok=True)
+
+        if path is not None:
+            os.makedirs(path, exist_ok=True)
 
         # Don't overwrite the videos we took last time we enabled video capture
         self.increment = 0

@@ -533,17 +533,21 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
     Run object detection on images streamed from a remote camera over UDP,
     also supports displaying live stream via GStreamer
     """
-    def __init__(self, host, port, record, *args, **kwargs):
+    def __init__(self, host, port, send_port, record, *args, **kwargs):
         self.record = record
         self.host = host
         self.port = port
+        self.send_port = send_port
         self.img_index = 1
 
         Gst.init(None)
+
         self.t_remote_gst = None
         self.t_restart = None
+        self.socket = None
 
         self.setup_gst()
+        self.send_connect()
 
         # Make sure we don't reinit GStreamer
         super().__init__(*args, **kwargs, gst_already_setup=True)
@@ -631,10 +635,48 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
             # We do this last since low_level_detection_show modifies
             # the image
             self.gst_next_detection(frame, detections)
+
+            # Send to autopilot, but try reconnecting if we lost the connection
+            self.send_detections(detections)
         finally:
             buf.unmap(mapinfo)
 
         return False
+
+    def send_connect(self):
+        if not self.socket:
+            context = zmq.Context()
+            self.socket = context.socket(zmq.PUB)
+            self.socket.setsockopt(zmq.SNDHWM, 1)
+            self.socket.setsockopt(zmq.RCVHWM, 1)
+            self.socket.setsockopt(zmq.CONFLATE, 1) # Only get last message
+            self.socket.connect("tcp://"+self.host+":"+str(self.send_port))
+
+    def send_detections(self, detections):
+        # Only get the highest one
+        detections.sort(key=lambda x: x["score"])
+
+        if len(detections) > 0:
+            best_detection = detections[-1]
+
+            # Prepare for JSON -- we can't have float32, so we convert to string
+            best = {
+                "score": str(best_detection["score"]),
+                "xmin": best_detection["xmin"],
+                "ymin": best_detection["ymin"],
+                "xmax": best_detection["xmax"],
+                "ymax": best_detection["ymax"],
+            }
+        else:
+            best = None
+
+        # If the socket has closed, try reconnecting
+        if not self.socket:
+            self.send_connect()
+
+        # If we successfully connected, send over the socket
+        if self.socket:
+            self.socket.send_json(best)
 
     def remote_gst_run(self):
         """ This is run in a separate thread. Start, loop, and cleanup. """
@@ -782,6 +824,8 @@ if __name__ == "__main__":
         help="Hostname to connect to if in remote mode (default 192.168.4.1)")
     parser.add_argument("--port", default=8555, type=int,
         help="Port to connect to if in remote mode (default 8555)")
+    parser.add_argument("--send-port", default=5555, type=int,
+        help="Port to send bounding boxes to on host (default 5555)")
 
     parser.add_argument("--remote-udp", dest='remote_udp', action='store_true',
         help="Run detection on remote streamed video over UDP (default)")
@@ -845,8 +889,8 @@ if __name__ == "__main__":
                 debug=args.debug, lite=args.lite, gst=args.gst) as d:
             d.run(args.host, args.port, show_image=args.show, record=record_dir)
     elif args.remote_udp:
-        with RemoteObjectDetectorUdp(args.host, args.port, record_dir,
-                args.model, args.labels,
+        with RemoteObjectDetectorUdp(args.host, args.port, args.send_port,
+                record_dir, args.model, args.labels,
                 debug=args.debug, lite=args.lite, gst=args.gst) as d:
             d.run()
     elif args.live:
