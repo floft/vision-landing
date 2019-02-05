@@ -1,0 +1,13 @@
+[Unit]
+Description=Stream Video
+
+[Service]
+ExecStart=/usr/bin/python3 -u /home/pi/vision-landing/control.py --device=tcp:127.0.0.1:5760
+Restart=always
+RestartSec=5
+User=pi
+Group=users
+SupplementaryGroups=dialout video
+
+[Install]
+WantedBy=multi-user.target

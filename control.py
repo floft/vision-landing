@@ -18,7 +18,10 @@ from autopilot_communication import AutopilotCommuncation
 class ControlStreaming:
     def __init__(self, device, baudrate, source_system, aux_channel,
             stream_port, receive_port, width, height,
-            framerate, enabled_mode=1, exit_mode=2):
+            framerate, enabled_mode=1, exit_mode=2,
+            threshold=0.0):
+        self.threshold = threshold
+
         # Create objects to communicate with autopilot and stream video
         self.ap = AutopilotCommuncation(
             device, baudrate, source_system,
@@ -56,15 +59,18 @@ class ControlStreaming:
 
         # Get bounding boxes back
         while self.socket:
-            detections = self.socket.recv_json()
+            detection = self.socket.recv_json()
 
-            if detections is not None:
+            # If no bounding box, it sends None
+            if detection is not None:
                 try:
-                    detections["score"] = float(detections["score"])
+                    detection["score"] = float(detection["score"])
                 except:
-                    detections["score"] = 0.0
+                    detection["score"] = 0.0
 
-            print(detections)
+                # If high enough, send to the autopilot
+                if detection["score"] > self.threshold:
+                    self.ap.send_detection(detection)
 
     def start_streaming(self):
         self.v_running = True

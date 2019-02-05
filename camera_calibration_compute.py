@@ -102,7 +102,7 @@ def save_camera_calibration(filename, mtx, dist):
         "dist": dist,
     })
 
-def load_camera_calibration(filename, mtx, dist):
+def load_camera_calibration(filename):
     d = np.load(filename).item()
     return d["mtx"], d["dist"]
 

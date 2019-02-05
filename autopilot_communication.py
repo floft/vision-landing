@@ -3,11 +3,21 @@
 Enable some functionality upon a switch on the R/C controller
 
 Examples: https://github.com/ArduPilot/pymavlink/blob/master/examples/
+https://github.com/ThermalSoaring/thermal-soaring/blob/master/networking_mavlink.py
 """
+import math
 import time
+import datetime
 import argparse
 import pymavlink
 from pymavlink import mavutil, mavwp, mavparm
+
+def us_since_epoch():
+    """ Microseconds since 1970-01-01 00:00:00 """
+    ep = datetime.datetime(1970,1,1,0,0,0)
+    diff = datetime.datetime.utcnow() - ep
+    diff_us = diff.total_seconds()*1e6 + diff.microseconds
+    return int(diff_us)
 
 class AutopilotCommuncation:
     def __init__(self, device="/dev/ttyAMA0", baudrate=115200, source_system=255,
@@ -63,6 +73,46 @@ class AutopilotCommuncation:
                         self.set_mode(c, 1)
                     else:
                         self.set_mode(c, 2)
+
+    def send_detection(self, detection,
+            horizontal_resolution=300, vertical_resolution=300,
+            horizontal_fov=62.2, vertical_fov=48.8):
+        x = (detection["xmin"] + detection["xmax"]) / 2
+        y = (detection["ymin"] + detection["ymax"]) / 2
+        height = 0 # TODO estimate height
+
+        # Convert fov to radians
+        # Given defaults above taken from:
+        # https://elinux.org/Rpi_Camera_Module#Technical_Parameters_.28v.2_board.29
+        # Alternative: https://stackoverflow.com/a/41137160/2698494
+        #    from camera_calibration_compute import load_camera_calibration
+        #    m = load_camera_calibration("camera_calibration.npy")
+        #    fx = 2*math.atan(640/2/a[0][0,0]) * 180/math.pi
+        #    fy = 2*math.atan(480/2/a[0][1,1]) * 180/math.pi
+        #    Gives: 83.80538074799328 and 68.51413217813369, which are wrong?
+        # Says it's the partial FOV of the camera at 640x480 for v2, so it's not
+        # quite the default values?
+        #    https://picamera.readthedocs.io/en/release-1.13/fov.html
+        horizontal_fov = horizontal_fov / 180 * math.pi
+        vertical_fov = vertical_fov / 180 * math.pi
+
+        # Rotate 90 degrees by swapping x and y since camera is rotated
+        # (so below, it normally would be angle_{x,y} then size_{x,y})
+        # TODO is this the correct way?
+        angle_y = (x - horizontal_resolution / 2) / horizontal_resolution * horizontal_fov
+        angle_x = (y - vertical_resolution / 2) / vertical_resolution * vertical_fov
+        size_y = (detection["xmax"] - detection["xmin"]) / horizontal_resolution * horizontal_fov
+        size_x = (detection["ymax"] - detection["ymin"]) / vertical_resolution * vertical_fov
+
+        self.master.mav.landing_target_send(
+            us_since_epoch(), # time_boot_ms (not used)
+            0,       # target num
+            0,       # frame
+            angle_x, # angle_x
+            angle_y, # angle_y
+            height, # height above target (m)
+            size_x, # size_x (rad) -- size of target
+            size_y) # size_y (rad) -- size of target
 
     def set_mode(self, channel, mode):
         if self.modes[channel] != mode:
