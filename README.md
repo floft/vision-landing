@@ -218,7 +218,7 @@ On Pi:
     cd ./vision-landing
     ./control.py # --device=tcp:127.0.0.1:5760 or --device=/dev/ttyAMA0 etc.
 
-Or, if you wish to always run on boot (running */home/pi/vision-landing/stream.py*
+Or, if you wish to always run on boot (running */home/pi/vision-landing/control.py*
 as user *pi* and group *dialout* for access to */dev/ttyAMA0*):
 
     sudo cp control.service /etc/systemd/system/
