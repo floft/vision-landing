@@ -76,7 +76,9 @@ class AutopilotCommuncation:
 
     def send_detection(self, detection,
             horizontal_resolution=300, vertical_resolution=300,
-            horizontal_fov=62.2, vertical_fov=48.8):
+            horizontal_fov=62.2, vertical_fov=48.8,
+            target_size=0.26, # diameter in meters
+            debug=True):
         x = (detection["xmin"] + detection["xmax"]) / 2
         y = (detection["ymin"] + detection["ymax"]) / 2
 
@@ -95,30 +97,38 @@ class AutopilotCommuncation:
         horizontal_fov = horizontal_fov / 180 * math.pi
         vertical_fov = vertical_fov / 180 * math.pi
 
-        # Rotate 90 degrees by swapping x and y since camera is rotated
-        # (so below, it normally would be angle_{x,y} then size_{x,y})
-        #
-        # TODO alternatively set PLND_YAW_ALIGN=+/-90?
-        # (opposite of the Pixhawk one, whatever I set it to)
-        angle_y = (x - horizontal_resolution / 2) / horizontal_resolution * horizontal_fov
-        angle_x = (y - vertical_resolution / 2) / vertical_resolution * vertical_fov
-        #size_y = (detection["xmax"] - detection["xmin"]) / horizontal_resolution * horizontal_fov
-        #size_x = (detection["ymax"] - detection["ymin"]) / vertical_resolution * vertical_fov
+        # Note: TODO set PLND_YAW_ALIGN=90 since RPi is rotated
+        angle_x = (x - horizontal_resolution / 2) / horizontal_resolution * horizontal_fov
+        angle_y = (y - vertical_resolution / 2) / vertical_resolution * vertical_fov
 
-        # TODO
-        # maybe just set angle_x and angle_y to -1 or something and see if it
-        # goes away and left
+        width = detection["xmax"] - detection["xmin"]
+        height = detection["ymax"] - detection["ymin"]
+        size_x = width / horizontal_resolution * horizontal_fov
+        size_y = height / vertical_resolution * vertical_fov
 
+        # Calculate height of drone above the target based on whichever measurement
+        # is larger. This is because if it's on the side of an image, it'll only
+        # detect part of the frying pan, but one side of it (the larger detected
+        # side) is probably all the way in the image, so use that for the size.
+        # This is easy since the frying pan is circular (not rectangular).
+        larger_size = max(size_x, size_y)
+        height = (target_size/2) / math.tan(larger_size/2)
+
+        # See:
+        # https://github.com/ArduPilot/ardupilot/blob/master/Tools/autotest/arducopter.py
+        # https://github.com/squilter/target-land/blob/master/target_land.py
         self.master.mav.landing_target_send(
             0,       # time_boot_ms (not used)
             0,       # target num
             0,       # frame
             angle_x, # angle_x
             angle_y, # angle_y
-            1+10*abs(angle_x), # height above target (m)
-            0, # size_x (rad) -- size of target
-            0) # size_y (rad) -- size of target
-        print("sent x", angle_x, "y", angle_y)
+            height, # height above target (m)
+            size_x, # size_x (rad) -- size of target
+            size_y) # size_y (rad) -- size of target
+
+        if debug:
+            print("sent x", angle_x, "y", angle_y, "z", height*3.28084, "ft")
 
     def set_mode(self, channel, mode):
         if self.modes[channel] != mode:
