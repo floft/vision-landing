@@ -91,7 +91,8 @@ class ControlStreaming:
         elif mode == self.exit_mode:
             print("Shutdown mode")
             self.exiting = True
-            self.exit()
+            self.ap.exit()
+            self.stop_streaming()
             self.shutdown()
         else:
             print("Stopping streaming")
