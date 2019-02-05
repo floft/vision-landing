@@ -79,7 +79,6 @@ class AutopilotCommuncation:
             horizontal_fov=62.2, vertical_fov=48.8):
         x = (detection["xmin"] + detection["xmax"]) / 2
         y = (detection["ymin"] + detection["ymax"]) / 2
-        height = 0 # TODO estimate height
 
         # Convert fov to radians
         # Given defaults above taken from:
@@ -98,21 +97,28 @@ class AutopilotCommuncation:
 
         # Rotate 90 degrees by swapping x and y since camera is rotated
         # (so below, it normally would be angle_{x,y} then size_{x,y})
-        # TODO is this the correct way?
+        #
+        # TODO alternatively set PLND_YAW_ALIGN=+/-90?
+        # (opposite of the Pixhawk one, whatever I set it to)
         angle_y = (x - horizontal_resolution / 2) / horizontal_resolution * horizontal_fov
         angle_x = (y - vertical_resolution / 2) / vertical_resolution * vertical_fov
-        size_y = (detection["xmax"] - detection["xmin"]) / horizontal_resolution * horizontal_fov
-        size_x = (detection["ymax"] - detection["ymin"]) / vertical_resolution * vertical_fov
+        #size_y = (detection["xmax"] - detection["xmin"]) / horizontal_resolution * horizontal_fov
+        #size_x = (detection["ymax"] - detection["ymin"]) / vertical_resolution * vertical_fov
+
+        # TODO
+        # maybe just set angle_x and angle_y to -1 or something and see if it
+        # goes away and left
 
         self.master.mav.landing_target_send(
-            us_since_epoch(), # time_boot_ms (not used)
+            0,       # time_boot_ms (not used)
             0,       # target num
             0,       # frame
             angle_x, # angle_x
             angle_y, # angle_y
-            height, # height above target (m)
-            size_x, # size_x (rad) -- size of target
-            size_y) # size_y (rad) -- size of target
+            1+10*abs(angle_x), # height above target (m)
+            0, # size_x (rad) -- size of target
+            0) # size_y (rad) -- size of target
+        print("sent x", angle_x, "y", angle_y)
 
     def set_mode(self, channel, mode):
         if self.modes[channel] != mode:
