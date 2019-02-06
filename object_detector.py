@@ -300,7 +300,8 @@ class ObjectDetectorBase:
     def __init__(self, model_file, labels_path, min_score=0.5,
             average_fps_frames=30, debug=False, lite=True,
             gst=False, gst_width=300, gst_height=300, gst_framerate=15,
-            gst_already_setup=False):
+            gst_display_width=640, gst_already_setup=False,
+            rotate=True, fix_aspect=True):
         self.debug = debug
         self.lite = lite
         self.gst = gst
@@ -328,10 +329,13 @@ class ObjectDetectorBase:
 
             self.pipe = Gst.Pipeline.new("object-detection")
 
-            # appsrc -> videoconvert (since data is RGB) -> autovideosink
+            # appsrc -> videoconvert (since data is RGB) -> [rotate] ->
+            #   videoscale -> set desired width -> autovideosink
             self.src = Gst.ElementFactory.make("appsrc")
             convert = Gst.ElementFactory.make("videoconvert")
-            sink = Gst.ElementFactory.make("autovideosink")
+            scale = Gst.ElementFactory.make("videoscale")
+            resize = Gst.ElementFactory.make("capsfilter")
+            sink = Gst.ElementFactory.make("xvimagesink")
 
             # For now we'll just assume it's a fixed size and a fixed framerate,
             # though it'll probably be less than this frame rate. It'll just
@@ -344,9 +348,36 @@ class ObjectDetectorBase:
             self.src.set_property("caps", caps)
             self.src.set_property("format", Gst.Format.TIME)
 
-            self.pipe.add(self.src, convert, sink)
+            # Scale video
+            gst_display_height = int(gst_height/gst_width*gst_display_width)
+
+            caps = Gst.Caps.from_string("video/x-raw," \
+                +"width="+str(gst_display_width)+"," \
+                +"height="+str(gst_display_height))
+            resize.set_property("caps", caps)
+
+            if fix_aspect:
+                if rotate:
+                    sink.set_property("pixel-aspect-ratio", "4/3")
+                else:
+                    sink.set_property("pixel-aspect-ratio", "3/4")
+
+            if rotate:
+                flip = Gst.ElementFactory.make("videoflip")
+                flip.set_property("method", "clockwise")
+
+            self.pipe.add(self.src, convert, scale, resize, sink)
             self.src.link(convert)
-            convert.link(sink)
+
+            if rotate:
+                self.pipe.add(flip)
+                convert.link(flip)
+                flip.link(scale)
+            else:
+                convert.link(scale)
+
+            scale.link(resize)
+            resize.link(sink)
 
             # Event loop
             self.loop = GLib.MainLoop()
