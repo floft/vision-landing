@@ -902,11 +902,16 @@ if __name__ == "__main__":
         help="Do not output debug information ")
 
     parser.set_defaults(
-        remote=False, remote_udp=True, live=False, offline=False,
+        remote=False, remote_udp=False, live=False, offline=False,
         lite=True, show=False, gst=True, debug=True)
     args = parser.parse_args()
 
-    assert args.remote + args.remote_udp + args.live + args.offline == 1, \
+    # Make remote-udp the default, unless overridden by something else
+    remote_udp = args.remote_udp
+    if args.remote + remote_udp + args.live + args.offline == 0:
+        remote_udp = True
+
+    assert args.remote + remote_udp + args.live + args.offline == 1, \
         "Must specify exactly one of --remote, --remote-udp --live, or --offline"
 
     record_dir = ""
@@ -919,7 +924,7 @@ if __name__ == "__main__":
         with RemoteObjectDetector(args.model, args.labels,
                 debug=args.debug, lite=args.lite, gst=args.gst) as d:
             d.run(args.host, args.port, show_image=args.show, record=record_dir)
-    elif args.remote_udp:
+    elif remote_udp:
         with RemoteObjectDetectorUdp(args.host, args.port, args.send_port,
                 record_dir, args.model, args.labels,
                 debug=args.debug, lite=args.lite, gst=args.gst) as d:
