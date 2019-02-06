@@ -578,7 +578,6 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
         self.socket = None
 
         self.setup_gst()
-        self.send_connect()
 
         # Make sure we don't reinit GStreamer
         super().__init__(*args, **kwargs, gst_already_setup=True)
@@ -606,6 +605,14 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
         bus.add_signal_watch()
         bus.connect("message", self.remote_gst_bus_call, self.remote_loop)
 
+    def wait_for_up(self):
+        """ Wait till we can ping the host """
+        response = 1
+
+        while not response == 0 and not self.exiting:
+            response = os.system("ping -c 1 " + self.host)
+            time.sleep(1)
+
     def run(self):
         # Don't overwrite previous images if there are any
         if self.record != "":
@@ -615,8 +622,15 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
             else:
                 self.img_index = latest_index(self.record, "*.jpg")+1
 
+        # Wait for the RPi to boot
+        self.wait_for_up()
+
+        # Start GStreamer
         self.gst_start()
         self.remote_gst_start()
+
+        # Open connection to send detections to RPi
+        self.send_connect()
 
         # We'll sleep in this thread and run GStreamer in a separate thread
         # since if we call remote_gst_run() here, it'll never exit on a Ctrl+C
@@ -681,7 +695,17 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
             self.socket.setsockopt(zmq.SNDHWM, 1)
             self.socket.setsockopt(zmq.RCVHWM, 1)
             self.socket.setsockopt(zmq.CONFLATE, 1) # Only get last message
+
+            # timeout after 2 seconds
+            # see: https://github.com/zeromq/pyzmq/issues/1143#issuecomment-366228397
+            self.socket.linger = 2000
+
             self.socket.connect("tcp://"+self.host+":"+str(self.send_port))
+
+    def send_close(self):
+        if self.socket:
+            self.socket.close(linger=2000)
+            self.socket = None
 
     def send_detections(self, detections):
         # Only get the highest one
@@ -700,10 +724,6 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
             }
         else:
             best = None
-
-        # If the socket has closed, try reconnecting
-        if not self.socket:
-            self.send_connect()
 
         # If we successfully connected, send over the socket
         if self.socket:
@@ -765,13 +785,18 @@ class RemoteObjectDetectorUdp(ObjectDetectorBase):
             self.remote_pipe.set_state(Gst.State.NULL)
             self.remote_gst_stop()
 
+            # Connection probably dropped too
+            self.send_close()
+
             time.sleep(1)
+            self.wait_for_up()
 
             # Recreate
             self.setup_gst()
 
             # Start again
             self.remote_gst_start()
+            self.send_connect()
 
 class LiveObjectDetector(ObjectDetectorBase):
     """ Run object detection on live images """
