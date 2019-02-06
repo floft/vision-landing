@@ -364,7 +364,7 @@ class ObjectDetectorBase:
 
             if rotate:
                 flip = Gst.ElementFactory.make("videoflip")
-                flip.set_property("method", "clockwise")
+                flip.set_property("method", "counterclockwise")
 
             self.pipe.add(self.src, convert, scale, resize, sink)
             self.src.link(convert)
