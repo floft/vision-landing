@@ -132,7 +132,9 @@ class AutopilotCommuncationSend:
 
         while not self.exiting:
             detection = self.buffer_manager.get_wait()
-            self.send_detection(detection)
+
+            if detection:
+                self.send_detection(detection)
 
     def send_detection(self, detection,
             horizontal_resolution=300, vertical_resolution=300,

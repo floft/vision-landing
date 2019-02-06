@@ -28,6 +28,7 @@ class BufferManager:
     def __init__(self, max_length=25):
         self.cond = threading.Condition()
         self.buffer = deque(maxlen=max_length)
+        self.exiting = False
 
     def add_data(self, data):
         """ Add new data """
@@ -50,13 +51,19 @@ class BufferManager:
     def get_wait(self):
         """ Wait till we have new data """
         with self.cond:
-            while True:
+            while not self.exiting:
                 data = self.get_data()
 
                 if data:
                     return data
 
                 self.cond.wait()
+
+    def exit(self):
+        """ Make sure anything waiting on this dies """
+        with self.cond:
+            self.exiting = True
+            self.cond.notify()
 
 class ControlStreaming:
     def __init__(self, device, baudrate, source_system, aux_channel,
@@ -134,6 +141,11 @@ class ControlStreaming:
         self.v_running = False
         self.v.stop()
 
+    def stop_ap_send(self):
+        self.ap_send.exit()
+        self.buffer_manager.exit()
+        self.t_ap_send.join() # wait for send thread to exit
+
     def on_mode(self, channel, mode):
         if mode == self.enabled_mode:
             # Only start streaming if not already running
@@ -146,9 +158,8 @@ class ControlStreaming:
             print("Shutdown mode")
             self.exiting = True
             self.ap.exit()
-            self.ap_send.exit()
             self.stop_streaming()
-            self.t_ap_send.join() # wait for send thread to exit
+            self.stop_ap_send()
             self.shutdown()
         else:
             print("Stopping streaming")
@@ -158,10 +169,9 @@ class ControlStreaming:
     def exit(self):
         self.exiting = True
         self.ap.exit()
-        self.ap_send.exit()
         self.stop_streaming()
+        self.stop_ap_send()
         self.t_ap.join()
-        self.t_ap_send.join()
 
     def shutdown(self):
         """ Shutdown the Pi """
