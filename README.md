@@ -201,12 +201,13 @@ And switch to using the custom hostapd:
     sudo systemctl restart dhcpcd dnsmasq hostapd-custom
 
 ## Pixhawk Setup
-Set these options:
+Set these options
+([yaw reference](https://docs.px4.io/en/config/flight_controller_orientation.html)):
 
     PLND_ENABLED=1 # enable always land
     PLND_TYPE=1 # companion computer
     PLND_EST_TYPE=1 # for EKF or raw, see which works best for you
-    PLND_YAW_ALIGN=90 # depending on how you mounted the camera on the drone
+    PLND_YAW_ALIGN=270 # depending on how you mounted the camera on the drone
 
 Then map a switch on your R/C controller to channel 6. For low PPM value it'll
 do nothing, for higher it'll stream, and for even higher it'll shut down the
