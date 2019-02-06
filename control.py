@@ -7,84 +7,52 @@ Shutdown via the 3rd position in the switch
 import zmq
 import time
 import argparse
-import threading
 import numpy as np
+import threading
+import multiprocessing
 
 from subprocess import call
 from collections import deque
 
+# Allow working with a deque between threads
+# http://stackoverflow.com/a/27345949
+from multiprocessing.managers import SyncManager
+SyncManager.register('deque', deque)
+
 from v4l2rtspserver import V4L2RTSPServer
-from autopilot_communication import AutopilotCommuncation, \
-    AutopilotCommuncationSend
-
-class BufferManager:
-    """
-    Add items to a deque and provide a function to wait for new items, which
-    will be run in a separate thread.
-
-    Based on:
-    https://github.com/ThermalSoaring/thermal-soaring/blob/master/soaring.py
-    """
-    def __init__(self, max_length=25):
-        self.cond = threading.Condition()
-        self.buffer = deque(maxlen=max_length)
-        self.exiting = False
-
-    def add_data(self, data):
-        """ Add new data """
-        with self.cond:
-            self.buffer.append(data)
-            self.cond.notify()
-
-    def get_data(self):
-        """ Get data now, if not available return None """
-        with self.cond:
-            data = self.buffer.copy()
-
-            if data:
-                d = data[0]
-                self.buffer.popleft()
-                return d
-
-            return None
-
-    def get_wait(self):
-        """ Wait till we have new data """
-        with self.cond:
-            while not self.exiting:
-                data = self.get_data()
-
-                if data:
-                    return data
-
-                self.cond.wait()
-
-    def exit(self):
-        """ Make sure anything waiting on this dies """
-        with self.cond:
-            self.exiting = True
-            self.cond.notify()
+from autopilot_communication_processes import Buffer, AutopilotConnection, \
+    AutopilotCommuncationReceive, AutopilotCommuncationSend
 
 class ControlStreaming:
-    def __init__(self, device, baudrate, source_system, aux_channel,
+    def __init__(self, sync_manager, device, baudrate, source_system, aux_channel,
             stream_port, receive_port, width, height,
             framerate, enabled_mode=1, exit_mode=2,
             threshold=0.0):
+        self.sync_manager = sync_manager
         self.threshold = threshold
 
-        # Create objects to communicate with autopilot and stream video
-        self.ap = AutopilotCommuncation(
-            device, baudrate, source_system,
-            [aux_channel], on_mode=lambda c, m: self.on_mode(c, m))
-
-        # Totally separate connection (i.e. we need network connection not
-        # serial, since you can't connect twice over serial)
+        # Get connection to autpilot
         #
-        # TODO ideally this would use just one connection but that may not
-        # be possible due to the GIL and if we block on receive...
-        self.buffer_manager = BufferManager()
-        self.ap_send = AutopilotCommuncationSend(self.buffer_manager,
-            device, baudrate, source_system)
+        # Note: apparently if we have one and block on receive, then it won't
+        # send while being blocked? One fix: have two.
+        self.ap_connection1 = AutopilotConnection(device, baudrate, source_system)
+        self.ap_connection2 = AutopilotConnection(device, baudrate, source_system)
+
+        # Receive messages from the autopilot - the enable switch
+        self.receive_buffer = Buffer(sync_manager)
+        self.ap_receive = AutopilotCommuncationReceive(
+            self.ap_connection1, [aux_channel],
+            on_mode=lambda c, m: self.on_mode_set(c, m))
+
+        # Since receive is in a separate process, we'll add its messages to
+        # a buffer in on_mode_set and then receive those in this process with
+        # on_mode_run and send them to the on_mode() function to actually handle
+        # them. Thus, we need to run on_mode_run() in a separate thread
+        self.t_mode = threading.Thread(target=self.on_mode_run)
+
+        # Send data to auto pilot through a buffer
+        self.send_buffer = Buffer(sync_manager)
+        self.ap_send = AutopilotCommuncationSend(self.ap_connection2, self.send_buffer)
 
         # Video streaming
         self.v = V4L2RTSPServer(None) # path isn't used
@@ -100,10 +68,6 @@ class ControlStreaming:
         # Params for video
         self.stream_params = (width, height, framerate, False)
 
-        # Create threads
-        self.t_ap = threading.Thread(target=self.ap.run)
-        self.t_ap_send = threading.Thread(target=self.ap_send.run)
-
         # Receive back bounding boxes
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
@@ -114,12 +78,26 @@ class ControlStreaming:
         self.socket.bind("tcp://*:"+str(receive_port))
 
     def run(self):
+        """ Start everything and wait """
         # Always start autopilot part, but not necessarily video yet
-        self.t_ap.start()
-        self.t_ap_send.start()
+        self.t_mode.start()
+        self.ap_connection1.connect()
+        self.ap_connection2.connect()
+        self.ap_receive.start()
+        self.ap_send.start()
 
+        # We could either run send_run() or on_mode_run() in a separate thread
+        # and the other in this (the main) thread. I chose to run on_mode_run()
+        # in a separate thread, so here we'll run send_run().
+        self.send_run()
+
+    def send_run(self):
+        """
+        In this thread, we'll receive detection bounding boxes and
+        send them to the autopilot process buffer to send to the autopilot.
+        """
         # Get bounding boxes back
-        while self.socket:
+        while self.socket and not self.exiting:
             detection = self.socket.recv_json()
 
             # If no bounding box, it sends None
@@ -131,22 +109,24 @@ class ControlStreaming:
 
                 # If high enough, add to the queue to send to the autopilot
                 if detection["score"] > self.threshold:
-                    self.buffer_manager.add_data(detection)
+                    self.send_buffer.add_data(detection)
 
-    def start_streaming(self):
-        self.v_running = True
-        self.v.start(*self.stream_params)
+    def on_mode_set(self, channel, mode):
+        """ This is executed in the AutopilotCommunicationReceive process, so
+        we add the data to a buffer that'll move it to the other process """
+        self.receive_buffer.add_data((channel, mode))
 
-    def stop_streaming(self):
-        self.v_running = False
-        self.v.stop()
+    def on_mode_run(self):
+        """ Wait for new modes to be added to the receive_buffer and pass to
+        on_mode() when added """
+        while not self.exiting:
+            values = self.receive_buffer.get_wait()
 
-    def stop_ap_send(self):
-        self.ap_send.exit()
-        self.buffer_manager.exit()
-        self.t_ap_send.join() # wait for send thread to exit
+            if values:
+                self.on_mode(values[0], values[1])
 
     def on_mode(self, channel, mode):
+        """ Function to handle mode changes """
         if mode == self.enabled_mode:
             # Only start streaming if not already running
             if not self.v_running:
@@ -156,22 +136,41 @@ class ControlStreaming:
                 print("Streaming already started")
         elif mode == self.exit_mode:
             print("Shutdown mode")
-            self.exiting = True
-            self.ap.exit()
-            self.stop_streaming()
-            self.stop_ap_send()
+            self.exit(from_mode_thread=True) # this is running in on_mode_run() thread
             self.shutdown()
         else:
             print("Stopping streaming")
             # Stop the streaming
             self.stop_streaming()
 
-    def exit(self):
+    def start_streaming(self):
+        self.v_running = True
+        self.v.start(*self.stream_params)
+
+    def stop_streaming(self):
+        self.v_running = False
+        self.v.stop()
+
+    def stop_ap_receive(self):
+        self.receive_buffer.exit()
+        self.ap_receive.exit()
+        self.ap_receive.join()
+
+    def stop_ap_send(self):
+        self.send_buffer.exit()
+        self.ap_send.exit()
+        self.ap_send.join()
+
+    def exit(self, from_mode_thread=False):
         self.exiting = True
-        self.ap.exit()
         self.stop_streaming()
+        self.stop_ap_receive()
         self.stop_ap_send()
-        self.t_ap.join()
+
+        # If we call exit() from the mode thread, we cannot join it to its
+        # own thread.
+        if not from_mode_thread:
+            self.t_mode.join()
 
     def shutdown(self):
         """ Shutdown the Pi """
@@ -204,13 +203,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    streaming = ControlStreaming(
-        args.device, args.baudrate, args.source_system, args.aux_channel,
-        args.stream_port, args.receive_port, args.width, args.height,
-        args.framerate)
+    with SyncManager() as sync_manager:
+        streaming = ControlStreaming(
+            sync_manager,
+            args.device, args.baudrate, args.source_system, args.aux_channel,
+            args.stream_port, args.receive_port, args.width, args.height,
+            args.framerate)
 
-    try:
-        streaming.run()
-    except KeyboardInterrupt:
-        print("Exiting")
-        streaming.exit()
+        try:
+            streaming.run()
+        except KeyboardInterrupt:
+            print("Exiting")
+            streaming.exit()
