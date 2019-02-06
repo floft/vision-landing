@@ -11,9 +11,52 @@ import threading
 import numpy as np
 
 from subprocess import call
+from collections import deque
 
 from v4l2rtspserver import V4L2RTSPServer
-from autopilot_communication import AutopilotCommuncation
+from autopilot_communication import AutopilotCommuncation, \
+    AutopilotCommuncationSend
+
+class BufferManager:
+    """
+    Add items to a deque and provide a function to wait for new items, which
+    will be run in a separate thread.
+
+    Based on:
+    https://github.com/ThermalSoaring/thermal-soaring/blob/master/soaring.py
+    """
+    def __init__(self, max_length=25):
+        self.cond = threading.Condition()
+        self.buffer = deque(maxlen=max_length)
+
+    def add_data(self, data):
+        """ Add new data """
+        with self.cond:
+            self.buffer.append(data)
+            self.cond.notify()
+
+    def get_data(self):
+        """ Get data now, if not available return None """
+        with self.cond:
+            data = self.buffer.copy()
+
+            if data:
+                d = data[0]
+                self.buffer.popleft()
+                return d
+
+            return None
+
+    def get_wait(self):
+        """ Wait till we have new data """
+        with self.cond:
+            while True:
+                data = self.get_data()
+
+                if data:
+                    return data
+
+                self.cond.wait()
 
 class ControlStreaming:
     def __init__(self, device, baudrate, source_system, aux_channel,
@@ -26,6 +69,15 @@ class ControlStreaming:
         self.ap = AutopilotCommuncation(
             device, baudrate, source_system,
             [aux_channel], on_mode=lambda c, m: self.on_mode(c, m))
+
+        # Totally separate connection (i.e. we need network connection not
+        # serial, since you can't connect twice over serial)
+        #
+        # TODO ideally this would use just one connection but that may not
+        # be possible due to the GIL and if we block on receive...
+        self.buffer_manager = BufferManager()
+        self.ap_send = AutopilotCommuncationSend(self.buffer_manager,
+            device, baudrate, source_system)
 
         # Video streaming
         self.v = V4L2RTSPServer(None) # path isn't used
@@ -43,6 +95,7 @@ class ControlStreaming:
 
         # Create threads
         self.t_ap = threading.Thread(target=self.ap.run)
+        self.t_ap_send = threading.Thread(target=self.ap_send.run)
 
         # Receive back bounding boxes
         self.context = zmq.Context()
@@ -56,6 +109,7 @@ class ControlStreaming:
     def run(self):
         # Always start autopilot part, but not necessarily video yet
         self.t_ap.start()
+        self.t_ap_send.start()
 
         # Get bounding boxes back
         while self.socket:
@@ -68,9 +122,9 @@ class ControlStreaming:
                 except:
                     detection["score"] = 0.0
 
-                # If high enough, send to the autopilot
+                # If high enough, add to the queue to send to the autopilot
                 if detection["score"] > self.threshold:
-                    self.ap.send_detection(detection)
+                    self.buffer_manager.add_data(detection)
 
     def start_streaming(self):
         self.v_running = True
@@ -92,7 +146,9 @@ class ControlStreaming:
             print("Shutdown mode")
             self.exiting = True
             self.ap.exit()
+            self.ap_send.exit()
             self.stop_streaming()
+            self.t_ap_send.join() # wait for send thread to exit
             self.shutdown()
         else:
             print("Stopping streaming")
@@ -102,8 +158,10 @@ class ControlStreaming:
     def exit(self):
         self.exiting = True
         self.ap.exit()
+        self.ap_send.exit()
         self.stop_streaming()
         self.t_ap.join()
+        self.t_ap_send.join()
 
     def shutdown(self):
         """ Shutdown the Pi """

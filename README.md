@@ -207,11 +207,19 @@ Set these options
     PLND_ENABLED=1 # enable always land
     PLND_TYPE=1 # companion computer
     PLND_EST_TYPE=1 # for EKF or raw, see which works best for you
-    PLND_YAW_ALIGN=270 # depending on how you mounted the camera on the drone
+
+    # Note: this would be ideal, but it's actually cdeg, so we'd have to set
+    # this to 27000, but it won't let me set values outside of [0,360]
+    # thus, we rotate in code
+    #PLND_YAW_ALIGN=270 # depending on how you mounted the camera on the drone
 
 Then map a switch on your R/C controller to channel 6. For low PPM value it'll
 do nothing, for higher it'll stream, and for even higher it'll shut down the
 Raspberry Pi (for exact values, see script).
+
+Optionally, if you wish to enable precision loiter on some R/C channel:
+
+    CH7_OPT=39
 
 ## Running
 On Pi:
