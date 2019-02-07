@@ -869,8 +869,8 @@ class OfflineObjectDetector(ObjectDetectorBase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="detect_float_v2.tflite", type=str,
-        help="Model file (if TF lite) or directory (if graph) (default detect_float_v2.tflite)")
+    parser.add_argument("--model", default="detect_float_v3.tflite", type=str,
+        help="Model file (if TF lite) or directory (if graph) (default detect_float_v3.tflite)")
     parser.add_argument("--labels", default="labels.txt", type=str,
         help="Label file (one per line) (default labels.txt")
 
