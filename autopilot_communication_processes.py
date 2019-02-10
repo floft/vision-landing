@@ -7,6 +7,7 @@ Enable some functionality upon a switch on the R/C controller
 Examples: https://github.com/ArduPilot/pymavlink/blob/master/examples/
 https://github.com/ThermalSoaring/thermal-soaring/blob/master/networking_mavlink.py
 """
+import os
 import math
 import time
 import datetime
@@ -125,10 +126,17 @@ class Buffer:
 
 class AutopilotConnection:
     def __init__(self, device="/dev/ttyAMA0", baudrate=115200,
-            source_system=255, autoreconnect=True):
+            source_system=255, autoreconnect=True, mavlink2=True):
+        # See: https://mavlink.io/en/mavgen_python/#dialect_file
+        if mavlink2:
+            os.environ["MAVLINK20"] = "1"
+            dialect = "common" # must be set to care about above line
+        else:
+            dialect = None
+
         print("Connecting to", device, "at", baudrate, "set to id", source_system)
         self.master = mavutil.mavlink_connection(device, baudrate, source_system,
-            autoreconnect=autoreconnect)
+            autoreconnect=autoreconnect, dialect=dialect)
 
     def connect(self):
         # Wait for a heartbeat so we know the target system IDs
@@ -166,16 +174,18 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
         self.master.mav.request_data_stream_send(
                 self.master.target_system,
                 self.master.target_component,
-                mavutil.mavlink.MAV_DATA_STREAM_RC_CHANNELS, self.rate, 1)
-        # For everything: MAV_DATA_STREAM_ALL
+                mavutil.mavlink.MAV_DATA_STREAM_ALL, self.rate, 1)
+        # For just RC channels: MAV_DATA_STREAM_RC_CHANNELS
         # See https://github.com/PX4/Firmware/blob/master/Tools/mavlink_px4.py#L338
 
         while not self.exiting.is_set():
-            msg = self.master.recv_match(blocking=True)
+            msg = self.master.recv_match(
+                type=["RC_CHANNELS", "RC_CHANNELS_RAW", "LANDING_TARGET"],
+                blocking=True)
             msg_type = msg.get_type()
             msg_data = msg.to_dict()
 
-            if msg_type == "RC_CHANNELS_RAW":
+            if msg_type == "RC_CHANNELS_RAW" or msg_type == "RC_CHANNELS":
                 for c in self.channels:
                     val = msg_data["chan"+str(c)+"_raw"]
 
@@ -185,6 +195,12 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
                         self.set_mode(c, 1)
                     else:
                         self.set_mode(c, 2)
+            elif msg_type == "LANDING_TARGET":
+                if "position_valid" in msg_data:
+                    target_acquired = msg_data["position_valid"]
+                    print("Target acquired:", target_acquired)
+                else:
+                    print("Landing target:", msg_data)
 
     def set_mode(self, channel, mode):
         if self.modes[channel] != mode:
