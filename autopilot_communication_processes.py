@@ -168,7 +168,7 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
         self.rate = rate
         self.on_mode = on_mode
 
-    def run(self):
+    def run(self, debug=True):
         # Set that we want to receive data
         print("Requesting data")
         self.master.mav.request_data_stream_send(
@@ -185,6 +185,8 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
             msg_type = msg.get_type()
             msg_data = msg.to_dict()
 
+            # If SERIALx_PROTOCOL = Mavlink 1 -- RC_CHANNELS_RAW
+            # if Mavlink 2 -- RC_CHANNELS
             if msg_type == "RC_CHANNELS_RAW" or msg_type == "RC_CHANNELS":
                 for c in self.channels:
                     val = msg_data["chan"+str(c)+"_raw"]
@@ -198,9 +200,11 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
             elif msg_type == "LANDING_TARGET":
                 if "position_valid" in msg_data:
                     target_acquired = msg_data["position_valid"]
-                    print("Target acquired:", target_acquired)
+                    if debug:
+                        print("Target acquired:", target_acquired)
                 else:
-                    print("Landing target:", msg_data)
+                    if debug:
+                        print("Landing target:", msg_data)
 
     def set_mode(self, channel, mode):
         if self.modes[channel] != mode:
@@ -233,7 +237,7 @@ class AutopilotCommuncationSend(multiprocessing.Process):
             horizontal_resolution=300, vertical_resolution=300,
             horizontal_fov=62.2, vertical_fov=48.8,
             target_size=0.26, # diameter in meters
-            debug=True):
+            debug=False):
         x = (detection["xmin"] + detection["xmax"]) / 2
         y = (detection["ymin"] + detection["ymax"]) / 2
 
