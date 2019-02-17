@@ -125,8 +125,24 @@ class Buffer:
             self.cond.notify()
 
 class AutopilotConnection:
+    """
+    Connection with MAVLink to the autopilot
+
+    By default use serial, but device can also be set to something like:
+        tcp:127.0.0.1:5760
+    if using mavlink-routerd for instance.
+
+    By default also uses MAVLink 2 since some data we're interested in like
+    if the target is acquired is only provided in the v2 messages.
+
+    source_system=1, source_component=2, because: "Other MAVLink capable
+    device on the vehicle (i.e. companion computer, gimbal) should use
+    the same System ID as the flight controller but use a different
+    Component ID" -- http://ardupilot.org/dev/docs/mavlink-basics.html
+    """
     def __init__(self, device="/dev/ttyAMA0", baudrate=115200,
-            source_system=255, autoreconnect=True, mavlink2=True):
+            source_system=1, source_component=2, autoreconnect=True,
+            mavlink2=True):
         # See: https://mavlink.io/en/mavgen_python/#dialect_file
         if mavlink2:
             os.environ["MAVLINK20"] = "1"
@@ -134,14 +150,18 @@ class AutopilotConnection:
         else:
             dialect = None
 
-        print("Connecting to", device, "at", baudrate, "set to id", source_system)
+        print("Connecting to", device, "at", baudrate, "set to ",
+            "system", source_system, "component", source_component)
         self.master = mavutil.mavlink_connection(device, baudrate, source_system,
-            autoreconnect=autoreconnect, dialect=dialect)
+            source_component, autoreconnect=autoreconnect, dialect=dialect)
 
     def connect(self):
         # Wait for a heartbeat so we know the target system IDs
         print("Waiting for heartbeat")
         self.master.wait_heartbeat()
+
+        print("Connecting to target", self.master.target_system,
+            "component", self.master.target_component)
 
 class AutopilotCommuncationReceive(multiprocessing.Process):
     def __init__(self, connection, channels=[6], cutoffs=[1282, 1716], rate=2,
@@ -237,7 +257,7 @@ class AutopilotCommuncationSend(multiprocessing.Process):
             horizontal_resolution=300, vertical_resolution=300,
             horizontal_fov=62.2, vertical_fov=48.8,
             target_size=0.26, # diameter in meters
-            debug=False):
+            debug=True):
         x = (detection["xmin"] + detection["xmax"]) / 2
         y = (detection["ymin"] + detection["ymax"]) / 2
 

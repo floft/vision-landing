@@ -35,6 +35,11 @@ class ControlStreaming:
         #
         # Note: apparently if we have one and block on receive, then it won't
         # send while being blocked? One fix: have two.
+        #
+        # Also note: source_system defaults to 1 now to indicate this code is
+        # actually on the drone itself (source_system=1 is the autopilot), but
+        # with different source_components since this isn't the autopilto but
+        # a companion computer.
         self.ap_connection1 = AutopilotConnection(device, baudrate, source_system)
         self.ap_connection2 = AutopilotConnection(device, baudrate, source_system)
 
@@ -184,8 +189,8 @@ if __name__ == "__main__":
         help="Master port baud rate (default 115200)")
     parser.add_argument("--device", type=str, default="/dev/ttyAMA0",
         help="Serial device (default /dev/ttyAMA0)")
-    parser.add_argument("--source-system", type=int, default=255,
-        help="MAVLink source system for this GCS (default 255)")
+    parser.add_argument("--source-system", type=int, default=1,
+        help="MAVLink source system (default 1, i.e. companion computer on the drone)")
     parser.add_argument("--aux-channel", type=int, default=6,
         help="What aux channel to use for enabling (default 6)")
 
