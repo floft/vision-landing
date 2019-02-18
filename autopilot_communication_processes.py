@@ -189,7 +189,31 @@ class AutopilotConnection:
             msg_data = msg.to_dict()
 
             if msg_type == "HOME_POSITION":
+                print("Got home position:", msg_data)
                 return msg_data
+
+        # Didn't get it, i.e. wait_condition evaluated to False at some point
+        return None
+
+    def get_yaw(self, wait_condition=True):
+        """
+        Get the next yaw from an attitude packet we can
+
+        Warning: make sure you have run request_all() before doing this.
+        Otherwise we'll never receive the attitude message.
+        """
+        if not self.connected:
+            return None
+
+        # Wait to receive it
+        while wait_condition:
+            msg = self.master.recv_match(type=["ATTITUDE"], blocking=True)
+            msg_type = msg.get_type()
+            msg_data = msg.to_dict()
+
+            if msg_type == "ATTITUDE":
+                print("Got attitude:", msg_data)
+                return msg_data["yaw"] # -pi..pi
 
         # Didn't get it, i.e. wait_condition evaluated to False at some point
         return None
@@ -236,7 +260,7 @@ class AutopilotConnection:
             wp.add(mavutil.mavlink.MAVLink_mission_item_message(
                 self.master.target_system, self.master.target_component,
                 seq, frame, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0,
-                hold, radius, 0, 0,
+                hold, radius, 0, math.nan,
                 lat, lon, alt))
 
             # Optionally land at the last waypoint
@@ -247,7 +271,7 @@ class AutopilotConnection:
                 wp.add(mavutil.mavlink.MAVLink_mission_item_message(
                     self.master.target_system, self.master.target_component,
                     seq, frame, mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0,
-                    0, 1, 0, 0,
+                    0, 1, 0, math.nan,
                     lat, lon, alt))
 
         self.master.waypoint_clear_all_send()
@@ -455,20 +479,30 @@ class AutopilotCommuncationSend(multiprocessing.Process):
             print("Waiting for home position (and for motors to be armed)")
             home = self.connection.get_home(lambda: not self.exiting.is_set())
 
-            if home:
+            # HOME_POSITION always sets the quaternion to (1,0,0,0) regardless
+            # of orientation, so get it from an ATTITUDE packet now since we're
+            # armed. Note: don't need to request_all() in this process since
+            # we did it in the receive process and these are both over the same
+            # link via mavlink-router.
+            yaw = self.connection.get_yaw()
+
+            if home and yaw:
                 # See: https://mavlink.io/en/messages/common.html#HOME_POSITION
                 home_lat = home["latitude"]*1e-7 # deg
                 home_lon = home["longitude"]*1e-7 # deg
                 #home_alt = home["altitude"]*1e-3 # m
                 # q is atitude quaternion: w, x, y, z order -- zero-rotation is {1, 0, 0, 0}
-                yaw = self.connection.get_yaw_from_quaternion(home["q"]) # from North
+                #yaw = self.connection.get_yaw_from_quaternion(home["q"]) # from North
 
                 # Calculate distances North and East to be a certain distance
                 # forward from the home position/heading
-                forward_6m = (6*math.sin(yaw), 6*math.cos(yaw))
-                forward_11m = (11.5*math.sin(yaw), 11.5*math.cos(yaw))
+                #
+                # Note: I'm in the northern hemisphere
+                forward_6m = (6*math.cos(yaw), 6*math.sin(yaw))
+                forward_11m = (11.5*math.cos(yaw), 11.5*math.sin(yaw))
 
                 # Calculate new waypoints for flight plan
+                # Note: set WPNAV_SPEED=180 or so to slow down navigation
                 """ Flight plan for actual egg drop
                 up = (0, 0, 0, 3) # up 3 meters above home position
                 forward = (0, forward_6m[0], forward_6m[1], 3) # forward 6 meters
@@ -486,9 +520,13 @@ class AutopilotCommuncationSend(multiprocessing.Process):
                     [up, forward, down, forward2],
                     land_at_end=True,
                     origin=(home_lat, home_lon, 0))
-                # TODO make sure WPNAV_SPEED=180
+
+                print("Done creating flight plan")
             else:
-                print("Warning: could not get home position")
+                if not home:
+                    print("Warning: could not get home position")
+                if not yaw:
+                    print("Warning: could not get yaw")
 
         # If we are flying autonomously, don't force landing until we've seen
         # the target a number of times. Otherwise, maybe it's a false positive.
@@ -511,6 +549,7 @@ class AutopilotCommuncationSend(multiprocessing.Process):
             # If flying autonomously and we've detected the target for long
             # enough, then land immediately
             if enable_auto and num_detections > min_num_detections and not already_set:
+                print("Setting to LAND mode")
                 self.connection.set_mode_land()
                 already_set = True
 
