@@ -152,9 +152,6 @@ class AutopilotConnection:
             source_component, autoreconnect=autoreconnect, dialect=dialect)
         self.connected = False
 
-        # Handle receiving waypoints such as the home position
-        self.wp = mavwp.MAVWPLoader()
-
     def connect(self):
         # Wait for a heartbeat so we know the target system IDs
         print("Waiting for heartbeat")
@@ -166,14 +163,11 @@ class AutopilotConnection:
 
     def get_home(self, wait_condition=True):
         """
-        Wait for and get the home position
+        Get the home position -- wait till armed though since set on arm
 
         We'll wait while wait_condition, which by default is forever, but you
         could alternatively set to something like (lambda: not exiting) for some
         exiting variable.
-
-        Warning: call this after you've run request_all(rate) otherwise this
-        will wait forever
         """
         if not self.connected:
             return None
@@ -183,25 +177,24 @@ class AutopilotConnection:
         self.master.motors_armed_wait()
 
         # Request the home point
-        self.master.waypoint_request_send(0)
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_GET_HOME_POSITION,
+            0, 0, 0, 0, 0, 0, 0, 0)
 
         # Wait to receive it
         while wait_condition:
-            msg = self.master.recv_match(type=["MISSION_ITEM_INT"],
-                blocking=True)
+            msg = self.master.recv_match(type=["HOME_POSITION"], blocking=True)
             msg_type = msg.get_type()
             msg_data = msg.to_dict()
 
-            if msg_type == "MISSION_ITEM_INT":
-                self.wp.add(msg)
-
-                # We only want the first one, i.e. the home position
-                return self.wp.wp(0)
+            if msg_type == "HOME_POSITION":
+                return msg_data
 
         # Didn't get it, i.e. wait_condition evaluated to False at some point
         return None
 
-    def send_waypoints(self, waypoints, radius=0.5, land_at_end=False):
+    def send_waypoints(self, waypoints, radius=0.5, land_at_end=False, local=False):
         """
         Send list of waypoints as a new flight plan
 
@@ -209,23 +202,31 @@ class AutopilotConnection:
         the next one, but only applies if hold time is > 1 second
 
         Format: [(hold1, lat1, lon1, alt1), ...]
-        Local format: [(hold1, x1, y1, z1), ...]
-
-        Note: this will override self.wp in case we later want to access the
-        flight plan we created.
+        Local format: [(hold1, x1, y1, z1), ...] where x=north, y=east, z=up (negated down)
 
         From: https://www.colorado.edu/recuv/2015/05/25/mavlink-protocol-waypoints
         See: https://mavlink.io/en/services/mission.html
+
+        Note: above link says that ArduPilot does not support local==True
         """
-        self.wp = mavwp.MAVWPLoader()
-        frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+        wp = mavwp.MAVWPLoader()
+
+        if local:
+            frame = mavutil.mavlink.MAV_FRAME_LOCAL_NED
+        else:
+            frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
 
         for i, (hold, lat, lon, alt) in enumerate(waypoints):
             # Sequence number is 1-indexed
             seq = i+1
 
+            # If local, to make this easier specify in NEU rather than NED
+            # since down seems un-intuitive
+            if local:
+                alt *= -1
+
             # Add waypoint
-            self.wp.add(mavutil.mavlink.MAVLink_mission_item_message(
+            wp.add(mavutil.mavlink.MAVLink_mission_item_message(
                 self.master.target_system, self.master.target_component,
                 seq, frame, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0,
                 hold, radius, 0, 0,
@@ -236,19 +237,21 @@ class AutopilotConnection:
                 seq += 1 # extra landing waypoint
 
                 # 1 == opportunistic precision land, i.e. use it if it's tracking
-                self.wp.add(mavutil.mavlink.MAVLink_mission_item_message(
+                wp.add(mavutil.mavlink.MAVLink_mission_item_message(
                     self.master.target_system, self.master.target_component,
                     seq, frame, mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0,
                     0, 1, 0, 0,
                     lat, lon, alt))
 
         self.master.waypoint_clear_all_send()
-        self.master.waypoint_count_send(self.wp.count())
+        self.master.waypoint_count_send(wp.count())
 
-        for _ in range(self.wp.count()):
-            msg = self.master.recv_match(type=['MISSION_REQUEST'], blocking=True)
-            self.master.mav.send(self.wp.wp(msg.seq))
+        for _ in range(wp.count()):
+            msg = self.master.recv_match(type=["MISSION_REQUEST"], blocking=True)
+            self.master.mav.send(wp.wp(msg.seq))
             print("Sending waypoint {0}".format(msg.seq))
+
+        return wp
 
     #
     # Request different data
@@ -394,20 +397,21 @@ class AutopilotCommuncationSend(multiprocessing.Process):
         # armed and from that we'll create the flight plan. Request all data
         # at a low frequency.
         if enable_auto:
-            # TODO this may override whatever we set it to in the receive process?
-            # In fact, since these are via TCP with mavlink-router it may forward
-            # all messages to both anyway? Thus, maybe not needed?
-            #self.connection.request_all(2)
             print("Waiting for home position (and for motors to be armed)")
             home = self.connection.get_home(lambda: not self.exiting.is_set())
 
             if home:
+                lat = home["latitude"]*1e-7/180*math.pi # rad
+                lon = home["longitude"]*1e-7/180*math.pi # rad
+                alt = home["altitude"]*1e-3 # m
+
                 """
                 # Calculate new waypoints
-                up = (0, home.lat, home.lng, home.z+3) # up 3 meters
-                forward = (0, ..., ..., home.z+3) # forward 6 meters
-                down = (0, ..., ..., home.z-3) # down 6 meters
-                forward2 = (1, ..., ..., home.z-3) # foward 5.5 meters, hold 1s
+                up = (0, lat, lon, alt+3) # up 3 meters
+                # calculate what is "forward" based on home position heading
+                forward = (0, ..., ..., alt+3) # forward 6 meters
+                down = (0, ..., ..., alt-3) # down 6 meters
+                forward2 = (1, ..., ..., alt-3) # foward 5.5 meters, hold 1s
 
                 self.connection.send_waypoints([up, forward, down, forward2, land],
                     land_at_end=True)
