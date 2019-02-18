@@ -53,12 +53,8 @@ def rotate(angle_x, angle_y):
     Or.... from this Youtube comment
     https://www.youtube.com/watch?v=5AVb2hA2EUs&lc=UggMS88TyPsEt3gCoAEC.8I2Q1bOkhXh8I3ZMGRRKTY
     saying "negative X = target to the left, negative Y = target is forward", then
-    we want:
+    we want: angle_y, -angle_x
     """
-    # Other tries:
-    #return angle_x, -angle_y # if x is forward, y is right
-    #return -angle_y, angle_x # if y is forward, x is right
-    #return angle_x, angle_y # if x is forward, y is right
     return angle_y, -angle_x # from Youtube comment and TF origin in top left
 
 class Buffer:
@@ -154,16 +150,161 @@ class AutopilotConnection:
             "system", source_system, "component", source_component)
         self.master = mavutil.mavlink_connection(device, baudrate, source_system,
             source_component, autoreconnect=autoreconnect, dialect=dialect)
+        self.connected = False
+
+        # Handle receiving waypoints such as the home position
+        self.wp = mavwp.MAVWPLoader()
 
     def connect(self):
         # Wait for a heartbeat so we know the target system IDs
         print("Waiting for heartbeat")
         self.master.wait_heartbeat()
+        self.connected = True
 
         print("Connecting to target", self.master.target_system,
             "component", self.master.target_component)
 
+    def get_home(self, wait_condition=True):
+        """
+        Wait for and get the home position
+
+        We'll wait while wait_condition, which by default is forever, but you
+        could alternatively set to something like (lambda: not exiting) for some
+        exiting variable.
+
+        Warning: call this after you've run request_all(rate) otherwise this
+        will wait forever
+        """
+        if not self.connected:
+            return None
+
+        # Home point is created when the motors are armed, so it won't be
+        # correct before then
+        self.master.motors_armed_wait()
+
+        # Request the home point
+        self.master.waypoint_request_send(0)
+
+        # Wait to receive it
+        while wait_condition:
+            msg = self.master.recv_match(type=["MISSION_ITEM_INT"],
+                blocking=True)
+            msg_type = msg.get_type()
+            msg_data = msg.to_dict()
+
+            if msg_type == "MISSION_ITEM_INT":
+                self.wp.add(msg)
+
+                # We only want the first one, i.e. the home position
+                return self.wp.wp(0)
+
+        # Didn't get it, i.e. wait_condition evaluated to False at some point
+        return None
+
+    def send_waypoints(self, waypoints, radius=0.5, land_at_end=False):
+        """
+        Send list of waypoints as a new flight plan
+
+        Radius is in meters -- how close to get to waypoint before heading to
+        the next one, but only applies if hold time is > 1 second
+
+        Format: [(hold1, lat1, lon1, alt1), ...]
+        Local format: [(hold1, x1, y1, z1), ...]
+
+        Note: this will override self.wp in case we later want to access the
+        flight plan we created.
+
+        From: https://www.colorado.edu/recuv/2015/05/25/mavlink-protocol-waypoints
+        See: https://mavlink.io/en/services/mission.html
+        """
+        self.wp = mavwp.MAVWPLoader()
+        frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+
+        for i, (hold, lat, lon, alt) in enumerate(waypoints):
+            # Sequence number is 1-indexed
+            seq = i+1
+
+            # Add waypoint
+            self.wp.add(mavutil.mavlink.MAVLink_mission_item_message(
+                self.master.target_system, self.master.target_component,
+                seq, frame, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0,
+                hold, radius, 0, 0,
+                lat, lon, alt))
+
+            # Optionally land at the last waypoint
+            if land_at_end and i == len(waypoints)-1:
+                seq += 1 # extra landing waypoint
+
+                # 1 == opportunistic precision land, i.e. use it if it's tracking
+                self.wp.add(mavutil.mavlink.MAVLink_mission_item_message(
+                    self.master.target_system, self.master.target_component,
+                    seq, frame, mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0,
+                    0, 1, 0, 0,
+                    lat, lon, alt))
+
+        self.master.waypoint_clear_all_send()
+        self.master.waypoint_count_send(self.wp.count())
+
+        for _ in range(self.wp.count()):
+            msg = self.master.recv_match(type=['MISSION_REQUEST'], blocking=True)
+            self.master.mav.send(self.wp.wp(msg.seq))
+            print("Sending waypoint {0}".format(msg.seq))
+
+    #
+    # Request different data
+    #
+    def request_all(self, rate):
+        """
+        Request all data
+        https://github.com/PX4/Firmware/blob/master/Tools/mavlink_px4.py#L338 """
+        if self.connected:
+            self.master.mav.request_data_stream_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_DATA_STREAM_ALL, rate, 1)
+
+    def request_rc(self, rate):
+        """
+        Request just RC channels
+        https://github.com/PX4/Firmware/blob/master/Tools/mavlink_px4.py#L338
+        """
+        if self.connected:
+            self.master.mav.request_data_stream_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_DATA_STREAM_RC_CHANNELS, rate, 1)
+
+    #
+    # Easy access to some commonly-used modes
+    #
+    # List, see mode_mapping_acm
+    # https://github.com/ArduPilot/pymavlink/blob/master/mavutil.py#L1840
+    def set_mode_poshold(self):
+        if self.connected:
+            self.master.set_mode("POSHOLD")
+
+    def set_mode_auto(self):
+        if self.connected:
+            self.master.set_mode_auto()
+
+    def set_mode_land(self):
+        if self.connected:
+            self.master.set_mode("LAND")
+
+    def set_mode_rtl(self):
+        if self.connected:
+            self.master.set_mode_rtl()
+
 class AutopilotCommuncationReceive(multiprocessing.Process):
+    """
+    The process that receives information from the autopilot
+
+    This will manage enabling and disabling. If a certain channel is set high,
+    then we'll start streaming video to the laptop. If it's set higher, then we'll
+    initiate shutdown (though the exact functionality is in callbacks implemented
+    in control.py). This also prints out debug information about if we have
+    acquired the landing target.
+    """
     def __init__(self, connection, channels=[6], cutoffs=[1282, 1716], rate=2,
             on_mode=None):
         """
@@ -181,7 +322,7 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
         # https://stackoverflow.com/a/1231648/2698494
         super().__init__()
         self.exiting = multiprocessing.Event()
-        self.master = connection.master
+        self.connection = connection
         self.channels = channels
         self.cutoffs = cutoffs
         self.modes = {c: None for c in self.channels}
@@ -189,17 +330,11 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
         self.on_mode = on_mode
 
     def run(self, debug=True):
-        # Set that we want to receive data
-        print("Requesting data")
-        self.master.mav.request_data_stream_send(
-                self.master.target_system,
-                self.master.target_component,
-                mavutil.mavlink.MAV_DATA_STREAM_ALL, self.rate, 1)
-        # For just RC channels: MAV_DATA_STREAM_RC_CHANNELS
-        # See https://github.com/PX4/Firmware/blob/master/Tools/mavlink_px4.py#L338
+        # Set that we want to receive all data
+        self.connection.request_all(self.rate)
 
         while not self.exiting.is_set():
-            msg = self.master.recv_match(
+            msg = self.connection.master.recv_match(
                 type=["RC_CHANNELS", "RC_CHANNELS_RAW", "LANDING_TARGET"],
                 blocking=True)
             msg_type = msg.get_type()
@@ -238,20 +373,73 @@ class AutopilotCommuncationReceive(multiprocessing.Process):
         self.exiting.set()
 
 class AutopilotCommuncationSend(multiprocessing.Process):
+    """
+    The process that sends information to the autopilot
+
+    This will both get the home point, calculate the flight path, and send that
+    to the autopilot. It will also send landing target messages whenever we
+    detect the target in an image (see control.py that receives these bounding
+    boxes and puts them into the buffer manager).
+    """
     def __init__(self, connection, buffer_manager):
         # Process able to exit
         # https://stackoverflow.com/a/1231648/2698494
         super().__init__()
         self.exiting = multiprocessing.Event()
         self.buffer_manager = buffer_manager
-        self.master = connection.master
+        self.connection = connection
 
-    def run(self):
+    def run(self, enable_auto=True, min_num_detections=10):
+        # If we will fly autonomously, then we first need to know where it was
+        # armed and from that we'll create the flight plan. Request all data
+        # at a low frequency.
+        if enable_auto:
+            # TODO this may override whatever we set it to in the receive process?
+            # In fact, since these are via TCP with mavlink-router it may forward
+            # all messages to both anyway? Thus, maybe not needed?
+            #self.connection.request_all(2)
+            print("Waiting for home position (and for motors to be armed)")
+            home = self.connection.get_home(lambda: not self.exiting.is_set())
+
+            if home:
+                """
+                # Calculate new waypoints
+                up = (0, home.lat, home.lng, home.z+3) # up 3 meters
+                forward = (0, ..., ..., home.z+3) # forward 6 meters
+                down = (0, ..., ..., home.z-3) # down 6 meters
+                forward2 = (1, ..., ..., home.z-3) # foward 5.5 meters, hold 1s
+
+                self.connection.send_waypoints([up, forward, down, forward2, land],
+                    land_at_end=True)
+                """
+                # TODO make sure WPNAV_SPEED=180
+                pass
+            else:
+                print("Warning: could not get home position")
+
+        # If we are flying autonomously, don't force landing until we've seen
+        # the target a number of times. Otherwise, maybe it's a false positive.
+        num_detections = 0
+
+        # Also, only set to land once. Otherwise, it's going to be hard to
+        # get it out of this mode if we want to manually take control.
+        already_set = False
+
         while not self.exiting.is_set():
+            # Wait for control.py to receive bounding boxes and add them to the
+            # deque passed to this process
             detection = self.buffer_manager.get_wait()
 
+            # Send detection to the autopilot
             if detection:
                 self.send_detection(detection)
+                num_detections += 1
+
+            # If flying autonomously and we've detected the target for long
+            # enough, then land immediately
+            if enable_auto and num_detections > min_num_detections and not already_set:
+                self.connection.set_mode_land()
+                already_set = True
 
     def send_detection(self, detection,
             horizontal_resolution=300, vertical_resolution=300,
@@ -299,7 +487,7 @@ class AutopilotCommuncationSend(multiprocessing.Process):
         # See:
         # https://github.com/ArduPilot/ardupilot/blob/master/Tools/autotest/arducopter.py
         # https://github.com/squilter/target-land/blob/master/target_land.py
-        self.master.mav.landing_target_send(
+        self.connection.master.mav.landing_target_send(
             0,       # time_boot_ms (not used)
             0,       # target num (not used)
             0,       # frame (not used)
