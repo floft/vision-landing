@@ -194,36 +194,43 @@ class AutopilotConnection:
         # Didn't get it, i.e. wait_condition evaluated to False at some point
         return None
 
-    def send_waypoints(self, waypoints, radius=0.5, land_at_end=False, local=False):
+    def send_waypoints(self, waypoints, radius=0.5, land_at_end=False,
+            origin=None):
         """
         Send list of waypoints as a new flight plan
 
         Radius is in meters -- how close to get to waypoint before heading to
         the next one, but only applies if hold time is > 1 second
 
-        Format: [(hold1, lat1, lon1, alt1), ...]
-        Local format: [(hold1, x1, y1, z1), ...] where x=north, y=east, z=up (negated down)
+        If origin==None: Format of waypoints is [(hold1, lat1, lon1, alt1), ...]
+
+        If origin == (orig_lat, orig_lon, orig_alt), then the format is:
+            [(hold1, north1, east1, alt1), ...] where the NEU (m) is relative to
+            the origin lat/lon/alt. Since apparently ArduPilot does not support
+            local reference frames, we do an approximate conversion to global
+            coordinates but calculated relative to the specified origin. Note
+            that the altitude is already relative to the home position though,
+            so you might just set orig_alt=0 and specify the altitudes relative
+            to the home position.
+
+        If land_at_end==True, then after the last waypoint, a final landing
+        waypoint is set at the same location as the last waypoint.
 
         From: https://www.colorado.edu/recuv/2015/05/25/mavlink-protocol-waypoints
         See: https://mavlink.io/en/services/mission.html
-
-        Note: above link says that ArduPilot does not support local==True
         """
         wp = mavwp.MAVWPLoader()
-
-        if local:
-            frame = mavutil.mavlink.MAV_FRAME_LOCAL_NED
-        else:
-            frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+        frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
 
         for i, (hold, lat, lon, alt) in enumerate(waypoints):
             # Sequence number is 1-indexed
             seq = i+1
 
-            # If local, to make this easier specify in NEU rather than NED
-            # since down seems un-intuitive
-            if local:
-                alt *= -1
+            # If relative to some origin, convert to global coordinates
+            if origin is not None:
+                orig_lat, orig_lon, orig_alt = origin
+                lat, lon = self.get_location_meters(orig_lat, orig_lon, lat, lon)
+                alt = orig_alt+alt
 
             # Add waypoint
             wp.add(mavutil.mavlink.MAVLink_mission_item_message(
@@ -252,6 +259,38 @@ class AutopilotConnection:
             print("Sending waypoint {0}".format(msg.seq))
 
         return wp
+
+    def get_location_meters(self, orig_lat, orig_lon, north_dist, east_dist):
+        """
+        Compute (lat, lon) north_dist meters North and east_dist meters East
+        of the (orig_lat, orig_lon) starting point. Assumes (lat,lon) was given
+        in degrees and returns result in degrees.
+
+        The function is useful when you want to move the vehicle around
+        specifying locations relative to the current vehicle position.
+
+        The algorithm is relatively accurate over small distances
+        (10m within 1km) except close to the poles.
+
+        For more information see:
+        http://gis.stackexchange.com/questions/2951/algorithm-for-offsetting-a-latitude-longitude-by-some-amount-of-meters
+
+        Based on get_location_metres given on:
+        http://python.dronekit.io/examples/guided-set-speed-yaw-demo.html#guided-example-source-code
+        https://github.com/dronekit/dronekit-python/blob/master/examples/guided_set_speed_yaw/guided_set_speed_yaw.py#L165
+        """
+        # Radius of "spherical" earth
+        earth_radius = 6378137.0
+
+        # Coordinate offsets in radians
+        dLat = north_dist / earth_radius
+        dLon = east_dist / (earth_radius * math.cos(orig_lat * math.pi/180))
+
+        # New position in decimal degrees
+        new_lat = orig_lat + (dLat * 180/math.pi)
+        new_lon = orig_lon + (dLon * 180/math.pi)
+
+        return new_lat, new_lon
 
     #
     # Request different data
@@ -401,20 +440,25 @@ class AutopilotCommuncationSend(multiprocessing.Process):
             home = self.connection.get_home(lambda: not self.exiting.is_set())
 
             if home:
-                lat = home["latitude"]*1e-7/180*math.pi # rad
-                lon = home["longitude"]*1e-7/180*math.pi # rad
-                alt = home["altitude"]*1e-3 # m
+                # See: https://mavlink.io/en/messages/common.html#HOME_POSITION
+                # q is atitude quaternion: w, x, y, z order -- zero-rotation is {1, 0, 0, 0}
+                home_lat = home["latitude"]*1e-7 # deg
+                home_lon = home["longitude"]*1e-7 # deg
+                #home_alt = home["altitude"]*1e-3 # m
+                home_q = home["q"] # list of 4 floats
 
                 """
                 # Calculate new waypoints
-                up = (0, lat, lon, alt+3) # up 3 meters
+                up = (0, 0, 0, 3) # up 3 meters
                 # calculate what is "forward" based on home position heading
-                forward = (0, ..., ..., alt+3) # forward 6 meters
-                down = (0, ..., ..., alt-3) # down 6 meters
-                forward2 = (1, ..., ..., alt-3) # foward 5.5 meters, hold 1s
+                forward = (0, ..., ..., 3) # forward 6 meters
+                down = (0, ..., ..., -3) # down 6 meters
+                forward2 = (1, ..., ..., -3) # foward 5.5 meters, hold 1s
 
-                self.connection.send_waypoints([up, forward, down, forward2, land],
-                    land_at_end=True)
+                self.connection.send_waypoints(
+                    [up, forward, down, forward2, land],
+                    land_at_end=True,
+                    origin=(home_lat, home_lon, 0))
                 """
                 # TODO make sure WPNAV_SPEED=180
                 pass
