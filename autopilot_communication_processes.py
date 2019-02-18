@@ -292,6 +292,22 @@ class AutopilotConnection:
 
         return new_lat, new_lon
 
+    def get_yaw_from_quaternion(self, q, degrees=False):
+        """
+        Extract the yaw angle from a quaternion
+
+        https://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles#Source_Code_2
+        """
+        w, x, y, z = q
+        siny_cosp = +2.0 * (w * z + x * y)
+        cosy_cosp = +1.0 - 2.0*(y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        if degrees:
+            return yaw * 180/math.pi
+
+        return yaw
+
     #
     # Request different data
     #
@@ -441,27 +457,36 @@ class AutopilotCommuncationSend(multiprocessing.Process):
 
             if home:
                 # See: https://mavlink.io/en/messages/common.html#HOME_POSITION
-                # q is atitude quaternion: w, x, y, z order -- zero-rotation is {1, 0, 0, 0}
                 home_lat = home["latitude"]*1e-7 # deg
                 home_lon = home["longitude"]*1e-7 # deg
                 #home_alt = home["altitude"]*1e-3 # m
-                home_q = home["q"] # list of 4 floats
+                # q is atitude quaternion: w, x, y, z order -- zero-rotation is {1, 0, 0, 0}
+                yaw = self.connection.get_yaw_from_quaternion(home["q"]) # from North
 
+                # Calculate distances North and East to be a certain distance
+                # forward from the home position/heading
+                forward_6m = (6*math.sin(yaw), 6*math.cos(yaw))
+                forward_11m = (11.5*math.sin(yaw), 11.5*math.cos(yaw))
+
+                # Calculate new waypoints for flight plan
+                """ Flight plan for actual egg drop
+                up = (0, 0, 0, 3) # up 3 meters above home position
+                forward = (0, forward_6m[0], forward_6m[1], 3) # forward 6 meters
+                down = (0, forward_6m[0], forward_6m[1], -3) # down 6 meters
+                forward2 = (1, forward_11m[0], forward_11m[1], -3) # foward 5.5 meters, hold 1s
                 """
-                # Calculate new waypoints
-                up = (0, 0, 0, 3) # up 3 meters
-                # calculate what is "forward" based on home position heading
-                forward = (0, ..., ..., 3) # forward 6 meters
-                down = (0, ..., ..., -3) # down 6 meters
-                forward2 = (1, ..., ..., -3) # foward 5.5 meters, hold 1s
+
+                # Debugging flight plan
+                up = (0, 0, 0, 6) # up 6 meters above home position
+                forward = (0, forward_6m[0], forward_6m[1], 6) # forward 6 meters
+                down = (0, forward_6m[0], forward_6m[1], 4.5) # down 1.5 meters
+                forward2 = (1, forward_11m[0], forward_11m[1], 4.5) # foward 5.5 meters, hold 1s
 
                 self.connection.send_waypoints(
-                    [up, forward, down, forward2, land],
+                    [up, forward, down, forward2],
                     land_at_end=True,
                     origin=(home_lat, home_lon, 0))
-                """
                 # TODO make sure WPNAV_SPEED=180
-                pass
             else:
                 print("Warning: could not get home position")
 
