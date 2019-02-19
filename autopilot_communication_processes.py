@@ -245,7 +245,7 @@ class AutopilotConnection:
         """
         wp = mavwp.MAVWPLoader()
         frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
-        seq = 1
+        seq = 1 # TODO maybe it skips takeoff command if this is not 0? try seq=0
         autocontinue = 1
 
         for i, (hold, lat, lon, alt) in enumerate(waypoints):
