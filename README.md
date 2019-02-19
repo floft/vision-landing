@@ -5,6 +5,8 @@ Use the model learned from the
 code and now run that on live RPi Zero camera input. We want to get the
 drone to land on the frying pan.
 
+See the [demo video on Youtube](https://www.youtube.com/watch?v=9iIUZG7x9K0).
+
 # Running Object Detection on another computer
 
 ## Wiring the Raspberry Pi to the Pixhawk
