@@ -470,11 +470,25 @@ class ObjectDetectorBase:
         if self.gst:
             self.t_gst.start()
 
-    def gst_next_detection(self, frame, detections):
+    def gst_next_detection(self, frame, detections, save_processed=False):
         """ Push new image to GStreamer """
         if self.gst:
             low_level_detection_show(frame, detections)
             self.gst_next_frame(frame)
+
+            # For debugging, save processed output
+            if save_processed:
+                # Hack for creating if not already defined
+                global last_frame_number
+                try:
+                    last_frame_number
+                except NameError:
+                    last_frame_number = 1
+
+                im = Image.fromarray(frame)
+                # Note: create /tmp/processed first though...
+                im.save("/tmp/processed/%07d.png"%last_frame_number)
+                last_frame_number += 1
 
     def gst_stop(self):
         """ If using GStreamer, tell it to exit and then wait """
