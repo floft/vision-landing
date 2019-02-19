@@ -218,8 +218,8 @@ class AutopilotConnection:
         # Didn't get it, i.e. wait_condition evaluated to False at some point
         return None
 
-    def send_waypoints(self, waypoints, radius=0.5, land_at_end=False,
-            origin=None):
+    def send_waypoints(self, waypoints, radius=0.5, land_at_end=True,
+            origin=None, takeoff_at_beginning=True):
         """
         Send list of waypoints as a new flight plan
 
@@ -245,34 +245,47 @@ class AutopilotConnection:
         """
         wp = mavwp.MAVWPLoader()
         frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+        seq = 1
+        autocontinue = 1
 
         for i, (hold, lat, lon, alt) in enumerate(waypoints):
-            # Sequence number is 1-indexed
-            seq = i+1
-
             # If relative to some origin, convert to global coordinates
             if origin is not None:
                 orig_lat, orig_lon, orig_alt = origin
                 lat, lon = self.get_location_meters(orig_lat, orig_lon, lat, lon)
                 alt = orig_alt+alt
 
+            # Optionally (probably) take off at beginning
+            # Maybe see:
+            # https://gist.github.com/donghee/8d8377ba51aa11721dcaa7c811644169
+            if takeoff_at_beginning and i == 0:
+                wp.add(mavutil.mavlink.MAVLink_mission_item_message(
+                    self.master.target_system, self.master.target_component,
+                    seq, frame, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, autocontinue,
+                    0, 0, 0, math.nan,
+                    lat, lon, alt))
+                print("takeoff at", lat, lon, alt)
+                seq += 1
+
             # Add waypoint
             wp.add(mavutil.mavlink.MAVLink_mission_item_message(
                 self.master.target_system, self.master.target_component,
-                seq, frame, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0,
+                seq, frame, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, autocontinue,
                 hold, radius, 0, math.nan,
                 lat, lon, alt))
+            print("waypoint at", lat, lon, alt)
+            seq += 1
 
             # Optionally land at the last waypoint
             if land_at_end and i == len(waypoints)-1:
-                seq += 1 # extra landing waypoint
-
                 # 1 == opportunistic precision land, i.e. use it if it's tracking
                 wp.add(mavutil.mavlink.MAVLink_mission_item_message(
                     self.master.target_system, self.master.target_component,
-                    seq, frame, mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0,
+                    seq, frame, mavutil.mavlink.MAV_CMD_NAV_LAND, 0, autocontinue,
                     0, 1, 0, math.nan,
                     lat, lon, alt))
+                print("land at", lat, lon, alt)
+                seq += 1
 
         self.master.waypoint_clear_all_send()
         self.master.waypoint_count_send(wp.count())
@@ -518,7 +531,6 @@ class AutopilotCommuncationSend(multiprocessing.Process):
 
                 self.connection.send_waypoints(
                     [up, forward, down, forward2],
-                    land_at_end=True,
                     origin=(home_lat, home_lon, 0))
 
                 print("Done creating flight plan")
