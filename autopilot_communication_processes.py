@@ -492,6 +492,9 @@ class AutopilotCommuncationSend(multiprocessing.Process):
         # If we will fly autonomously, then we first need to know where it was
         # armed and from that we'll create the flight plan. Request all data
         # at a low frequency.
+        #
+        # TODO recreate the flight plan whenever we arm the motors so we don't
+        # have to restart control.py every time we do another test
         if enable_auto:
             print("Waiting for home position (and for motors to be armed)")
             home = self.connection.get_home(lambda: not self.exiting.is_set())
@@ -564,6 +567,12 @@ class AutopilotCommuncationSend(multiprocessing.Process):
 
             # If flying autonomously and we've detected the target for long
             # enough, then land immediately
+            #
+            # TODO keep a timer as well, and reset the count if tracking is lost
+            # after a couple seconds. Otherwise, it'll eventually get enough
+            # false positives to make this trigger.
+            #
+            # TODO reset already_set whenever we disarm the motors
             if enable_auto and num_detections > min_num_detections and not already_set:
                 print("Setting to LAND mode")
                 self.connection.set_mode_land()
