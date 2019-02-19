@@ -8,6 +8,7 @@ calibration*/
 __pycache__/
 .vscode
 *.jpg
+*.png
 *.mp4
 *.param
 results.txt
